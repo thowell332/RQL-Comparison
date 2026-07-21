@@ -1,0 +1,23 @@
+!!python/object/apply:collections.OrderedDict
+- - - batch_size
+    - 256
+  - - buffer_size
+    - 1000000
+  - - ent_coef
+    - auto
+  - - gamma
+    - 0.95
+  - - learning_rate
+    - 0.001
+  - - n_envs
+    - 4
+  - - n_timesteps
+    - 800000.0
+  - - policy
+    - MlpPolicy
+  - - policy_kwargs
+    - dict(net_arch=[256, 256, 256])
+  - - warmstarting_num_timesteps
+    - 100000
+  - - warmstarting_scale
+    - 10

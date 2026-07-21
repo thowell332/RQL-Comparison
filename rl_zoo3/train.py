@@ -165,7 +165,13 @@ def train() -> None:
         importlib.import_module(env_module)
 
     env_id = args.env
-    registered_envs = set(gym.envs.registry.env_specs.keys())  # pytype: disable=module-attr
+    # Handle both old and new gym API
+    try:
+        # New gym/gymnasium: registry is a dict
+        registered_envs = set(gym.envs.registry.keys())
+    except AttributeError:
+        # Old gym: registry has env_specs attribute
+        registered_envs = set(gym.envs.registry.env_specs.keys())  # pytype: disable=module-attr
 
     if args.yaml_file is not None:
         raise ValueError(

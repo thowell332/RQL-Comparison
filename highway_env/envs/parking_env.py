@@ -145,7 +145,7 @@ class ParkingEnv(AbstractEnv, GoalEnv):
         """Create some new random vehicles of a given type, and add them on the road."""
         self.controlled_vehicles = []
         for i in range(self.config["controlled_vehicles"]):
-            vehicle = self.action_type.vehicle_class(self.road, [i*20, 0], 2*np.pi*self.np_random.rand(), 0)
+            vehicle = self.action_type.vehicle_class(self.road, [i*20, 0], 2*np.pi*self.np_random.random(), 0)
             self.road.vehicles.append(vehicle)
             self.controlled_vehicles.append(vehicle)
 
@@ -195,7 +195,7 @@ class ParkingEnvRandomInit(ParkingEnv):
         """Create some new random vehicles of a given type, and add them on the road."""
         self.controlled_vehicles = []
         for i in range(self.config["controlled_vehicles"]):
-            vehicle = self.action_type.vehicle_class(self.road, [self.np_random.rand()*180-100, self.np_random.rand()*180-100], 2*np.pi*self.np_random.rand(), 6*self.np_random.rand()-3)
+            vehicle = self.action_type.vehicle_class(self.road, [self.np_random.random()*180-100, self.np_random.random()*180-100], 2*np.pi*self.np_random.random(), 6*self.np_random.random()-3)
             self.road.vehicles.append(vehicle)
             self.controlled_vehicles.append(vehicle)
 
@@ -321,7 +321,7 @@ class ParkingVectorlizedEnv(AbstractEnv, GoalEnv):
         """Create some new random vehicles of a given type, and add them on the road."""
         self.controlled_vehicles = []
         for i in range(self.config["controlled_vehicles"]):
-            vehicle = self.action_type.vehicle_class(self.road, [i*20, 0], 2*np.pi*self.np_random.rand(), 0)
+            vehicle = self.action_type.vehicle_class(self.road, [i*20, 0], 2*np.pi*self.np_random.random(), 0)
             self.road.vehicles.append(vehicle)
             self.controlled_vehicles.append(vehicle)
 

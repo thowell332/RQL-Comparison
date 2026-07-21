@@ -1,0 +1,9 @@
+{
+    "__class__": "<class 'rl_agents.agents.tree_search.mctsme.MCTSAgentME'>",
+    "episodes": 150,
+    "horizon": 6,
+    "temperature": 0.1,
+    "Plot": 0,
+    "DQN_prior": 1,
+    "model_path": "./logs/dqn_ME/highway_basic_2025-12-15T23:10:04.441407/policies/final/model.zip" 
+}

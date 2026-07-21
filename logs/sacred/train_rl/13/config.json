@@ -1,0 +1,71 @@
+{
+  "agent_path": null,
+  "environment": {
+    "env_make_kwargs": {},
+    "gym_id": "parking-basic-v0",
+    "max_episode_steps": null,
+    "num_vec": 4,
+    "parallel": true
+  },
+  "load_reward_kwargs": {},
+  "logging": {
+    "log_dir": "logs/sac/parking_basic_2025-12-20T10:30:34.362751/",
+    "log_format_strs": [
+      "tensorboard",
+      "stdout"
+    ],
+    "log_format_strs_additional": {},
+    "log_level": 20,
+    "log_root": null,
+    "wandb": {
+      "wandb_additional_info": {},
+      "wandb_kwargs": {
+        "monitor_gym": false,
+        "project": "imitation",
+        "save_code": false
+      },
+      "wandb_name_prefix": "",
+      "wandb_tag": null
+    }
+  },
+  "normalize_kwargs": {},
+  "normalize_reward": false,
+  "policy": {
+    "policy_cls": {
+      "py/type": "stable_baselines3.sac.policies.SACPolicy"
+    },
+    "policy_kwargs": {
+      "net_arch": [
+        256,
+        256,
+        256
+      ]
+    }
+  },
+  "policy_evaluation": {
+    "n_episodes_eval": 50
+  },
+  "policy_save_final": true,
+  "policy_save_interval": 10000,
+  "reward_path": null,
+  "reward_type": null,
+  "rl": {
+    "batch_size": 256,
+    "hyperparameter_directory": "/mnt/d/OneDrive - Tufts/RQL-Comparison/hyperparams",
+    "rl_cls": {
+      "py/type": "stable_baselines3.sac.sac.SAC"
+    },
+    "rl_kwargs": {
+      "batch_size": null,
+      "buffer_size": 1000000,
+      "ent_coef": 0.0097,
+      "gamma": 0.95,
+      "learning_rate": 0.001
+    }
+  },
+  "rollout_save_final": true,
+  "rollout_save_n_episodes": 10000,
+  "rollout_save_n_timesteps": null,
+  "seed": 1,
+  "total_timesteps": 500000
+}

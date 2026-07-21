@@ -194,8 +194,8 @@ class HighwayEnvMEAddRightRewardALL(HighwayEnv):
         cfg = super().default_config()
         cfg.update({
             "simulation_frequency": 5,
-            "lanes_count": 3,
-            "vehicles_count": 30,
+            "lanes_count": 4,
+            "vehicles_count": 40,
             "duration": 40,  # [s]
             "ego_spacing": 1.5,
             "collision_reward": -0.5,    # The reward received when colliding with a vehicle.

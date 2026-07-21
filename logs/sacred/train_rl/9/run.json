@@ -1,0 +1,167 @@
+{
+  "artifacts": [],
+  "command": "train_rl",
+  "experiment": {
+    "base_dir": "/mnt/d/OneDrive - Tufts/RQL-Comparison/imitation/scripts/config",
+    "dependencies": [
+      "huggingface-sb3==3.0",
+      "numpy==2.3.5",
+      "pyyaml==6.0.3",
+      "sacred==0.8.7",
+      "stable-baselines3==2.7.1"
+    ],
+    "mainfile": "train_rl.py",
+    "name": "train_rl",
+    "repositories": [
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      },
+      {
+        "commit": "347c36580b5f5ea64e6d1a34795a686c475f984a",
+        "dirty": true,
+        "url": "git@github.com:thowell332/RQL-Comparison.git"
+      }
+    ],
+    "sources": [
+      [
+        "train_rl.py",
+        "_sources/train_rl_bf799fc32adcd6e64c1c820fecc97567.py"
+      ],
+      [
+        "../ingredients/__init__.py",
+        "_sources/__init___a356bc88be873a115b698ac3aefa973f.py"
+      ],
+      [
+        "../ingredients/environment.py",
+        "_sources/environment_44c480672b5c03d4c355bab64e656deb.py"
+      ],
+      [
+        "../ingredients/logging.py",
+        "_sources/logging_11586f21f44a23f8e2affe5af18a2d62.py"
+      ],
+      [
+        "../ingredients/policy.py",
+        "_sources/policy_93c1aee3a02029648f641622b1d41c48.py"
+      ],
+      [
+        "../ingredients/policy_evaluation.py",
+        "_sources/policy_evaluation_fec6bd22e56a19a3d77db0ab20cdeaf1.py"
+      ],
+      [
+        "../ingredients/rl.py",
+        "_sources/rl_d85687e531fb7c2077f53bc60828ae41.py"
+      ],
+      [
+        "../ingredients/wb.py",
+        "_sources/wb_a4410256a409280e8ccf177fe1ef8c8e.py"
+      ]
+    ]
+  },
+  "fail_trace": [
+    "Traceback (most recent call last):\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/venv/lib/python3.12/site-packages/sacred/config/captured_function.py\", line 42, in captured_function\n    result = wrapped(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/train_rl.py\", line 211, in train_rl\n    rl_algo.learn(total_timesteps, callback=callback)\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/sac/sac.py\", line 299, in learn\n    return super().learn(\n           ^^^^^^^^^^^^^^\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/common/off_policy_algorithm.py\", line 353, in learn\n    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/sac/sac.py\", line 207, in train\n    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/common/buffers.py\", line 286, in sample\n    return super().sample(batch_size=batch_size, env=env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/common/buffers.py\", line 111, in sample\n    return self._get_samples(batch_inds, env=env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+    "  File \"/mnt/d/OneDrive - Tufts/RQL-Comparison/stable_baselines3/common/buffers.py\", line 297, in _get_samples\n    env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))\n                                                               ^^^^^^^^^^^^^^^\n",
+    "TypeError: object of type 'int' has no len()\n"
+  ],
+  "heartbeat": "2025-12-20T14:29:55.442285",
+  "host": {
+    "ENV": {},
+    "cpu": "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz",
+    "gpus": {
+      "driver_version": "576.02",
+      "gpus": [
+        {
+          "model": "NVIDIA GeForce RTX 2060",
+          "persistence_mode": true,
+          "total_memory": 6144
+        }
+      ]
+    },
+    "hostname": "DESKTOP-IQVN3IF",
+    "os": [
+      "Linux",
+      "Linux-5.10.16.3-microsoft-standard-WSL2-x86_64-with-glibc2.31"
+    ],
+    "python_version": "3.12.8"
+  },
+  "meta": {
+    "command": "train_rl",
+    "config_updates": {
+      "agent_path": "logs/sac/parking_basic_2025-12-19T11:07:59.061610/policies/000000350000/model.zip",
+      "logging.log_dir": "logs/sac/parking_basic_2025-12-20T09:28:45.234032/",
+      "rollout_save_n_episodes": 10000,
+      "seed": 1,
+      "total_timesteps": 500000
+    },
+    "named_configs": [
+      "parking_basic",
+      "rl.sac",
+      "policy.sac"
+    ],
+    "options": {
+      "--beat-interval": null,
+      "--capture": null,
+      "--comment": null,
+      "--debug": false,
+      "--enforce_clean": false,
+      "--file_storage": null,
+      "--force": false,
+      "--help": false,
+      "--id": null,
+      "--loglevel": null,
+      "--mongo_db": null,
+      "--name": null,
+      "--pdb": false,
+      "--print-config": false,
+      "--priority": null,
+      "--queue": false,
+      "--s3": null,
+      "--sql": null,
+      "--tiny_db": null,
+      "--unobserved": false
+    }
+  },
+  "resources": [],
+  "result": null,
+  "start_time": "2025-12-20T14:28:46.071095",
+  "status": "FAILED",
+  "stop_time": "2025-12-20T14:29:55.459179"
+}

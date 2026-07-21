@@ -1,0 +1,25 @@
+!!python/object/apply:collections.OrderedDict
+- - - batch_size
+    - 32
+  - - buffer_size
+    - 15000
+  - - exploration_fraction
+    - 0.7
+  - - gamma
+    - 0.8
+  - - gradient_steps
+    - 1
+  - - learning_rate
+    - 0.0001
+  - - learning_starts
+    - 200
+  - - n_timesteps
+    - 500000.0
+  - - policy
+    - MlpPolicy
+  - - policy_kwargs
+    - dict(net_arch=[256, 256])
+  - - target_update_interval
+    - 50
+  - - train_freq
+    - 1

@@ -116,6 +116,10 @@ class MCTSME(AbstractPlanner):
         self.env = env
         self.prior_policy = prior_policy
         self.rollout_policy = rollout_policy
+        # Optional callable(state, observation) -> bool mask over action_space.
+        # When set (e.g. from eval_mcts --safe-decide), DQN_prior_policy keeps only
+        # permissible actions (min-violation set) and renormalizes.
+        self.action_filter = None
         if not self.config["horizon"]:
             self.config["episodes"], self.config["horizon"] = \
                 OLOP.allocation(self.config["budget"], self.config["gamma"])
@@ -124,17 +128,41 @@ class MCTSME(AbstractPlanner):
         if (self.config["DQN_prior"]==1):
             from stable_baselines3 import DQN_ME
             model_path = self.config["model_path"]
-            self.DQN_model = DQN_ME.load(model_path,device="cpu")
+            # Use GPU if available, otherwise CPU
+            device = self.config.get("device", "auto")
+            if device == "auto":
+                device = "cuda" if th.cuda.is_available() else "cpu"
+            self.DQN_model = DQN_ME.load(model_path, device=device)
+            self.device = device
             self.prior_policy = self.DQN_prior_policy
             self.rollout_policy = self.DQN_prior_policy
-            print("using priror policy")
+            print(f"using prior policy on {device}")
 
     def DQN_prior_policy(self, state, observation):
         new_obs = np.array([observation])
-        Q_value = self.DQN_model.q_net(th.from_numpy(new_obs))
+        # Move tensor to the same device as the model
+        obs_tensor = th.from_numpy(new_obs).to(self.device)
+        Q_value = self.DQN_model.q_net(obs_tensor)
         p_soft = th.exp(Q_value - (th.logsumexp(Q_value,1).reshape(-1,1)).expand(-1, Q_value.shape[1]))
         actions = np.arange(state.action_space.n)
-        probabilities = ((p_soft).detach().numpy()).flatten()
+        probabilities = ((p_soft).detach().cpu().numpy()).flatten()
+
+        if self.action_filter is not None:
+            mask = np.asarray(self.action_filter(state, observation), dtype=bool)
+            if mask.shape != (state.action_space.n,):
+                raise ValueError(
+                    f"action_filter mask shape {mask.shape} does not match "
+                    f"action_space.n={state.action_space.n}"
+                )
+            actions = actions[mask]
+            probabilities = probabilities[mask]
+            prob_sum = float(probabilities.sum())
+            if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+                # Match supervisor decide: fall back to uniform over the permissible set
+                probabilities = np.ones(len(actions), dtype=np.float64) / len(actions)
+            else:
+                probabilities = probabilities / prob_sum
+
         return actions, probabilities
 
 
@@ -200,7 +228,22 @@ class MCTSME(AbstractPlanner):
     def plan(self, state, observation):
         self.root.count -= 1
         for i in range(self.config['episodes']):
-            self.run(safe_deepcopy_env(state), observation)
+            env_copy = safe_deepcopy_env(state)
+            # Ensure the copied environment can be stepped by setting the _has_reset flag
+            # This is needed for gym's OrderEnforcing wrapper which checks if reset() was called
+            # The environment copy is already in the correct state, we just need to mark it as reset
+            env = env_copy
+            while env is not None:
+                if hasattr(env, '_has_reset'):
+                    env._has_reset = True
+                # Check if there's a nested environment (for wrappers)
+                env = getattr(env, 'env', None)
+            self.run(env_copy, observation)
+            # Log progress for long-running planning
+            if self.config['episodes'] > 50 and (i + 1) % 50 == 0:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f'MCTS planning: {i+1}/{self.config["episodes"]} episodes')
         return self.get_plan()
 
     def get_plan(self):
@@ -233,13 +276,14 @@ class MCTSNode(Node):
         if not self.children:
             return None
 
-        # Tie best counts by best value    
-        all_childrens = list(self.children.values())
+        # Return action keys (not child-list indices) so filtered action subsets work.
+        actions = list(self.children.keys())
+        all_childrens = [self.children[a] for a in actions]
         all_q_values = np.array([child.value for child in all_childrens])
         all_pre_values = np.array([np.log(child.prior) for child in all_childrens])
-        log_pro = all_q_values + all_pre_values 
+        log_pro = all_q_values + all_pre_values
         idx = np.argmax(log_pro)
-        return idx
+        return actions[idx]
 
     def sampling_rule(self, temperature=None):
         """
@@ -248,14 +292,15 @@ class MCTSNode(Node):
             - else, select the action with maximum visit count
 
         :param temperature: the exploration parameter, positive or zero
-        :return: the selected action
+        :return: the selected action (action id / dict key, not a child-list index)
         """
 
         if self.children:
-            all_childrens = list(self.children.values())
+            actions = list(self.children.keys())
+            all_childrens = [self.children[a] for a in actions]
             a_dim = len(all_childrens)
             if (self.count < a_dim):
-                return self.count
+                return actions[self.count]
 
             tem = (temperature * a_dim) / np.log(1+self.count)
 
@@ -272,7 +317,7 @@ class MCTSNode(Node):
             pro = np.cumsum(pro)
             p_sample = 0.999999*np.random.rand(1)
             idx = np.searchsorted(pro, p_sample)
-            return idx[0]
+            return actions[int(idx[0])]
         else:
             return None
 
@@ -309,7 +354,7 @@ class MCTSNode(Node):
             logexpqsum = scipy.special.logsumexp(all_q_values + all_pre_values)
 
             self.parent.update_branch(logexpqsum)
-        elif (self.planner.config["Plot"]==1):
+        elif (self.planner.config.get("Plot", 0) == 1):
             all_childrens = list(self.children.values())
             all_q_values = np.array([child.value for child in all_childrens])
             all_pre_values = np.array([np.log(child.prior) for child in all_childrens])

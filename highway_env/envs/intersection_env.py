@@ -215,7 +215,7 @@ class IntersectionEnv(AbstractEnv):
                        speed_deviation: float = 1.,
                        spawn_probability: float = 0.6,
                        go_straight: bool = False) -> None:
-        if self.np_random.rand() > spawn_probability:
+        if self.np_random.random() > spawn_probability:
             return
 
         route = self.np_random.choice(range(4), size=2, replace=False)

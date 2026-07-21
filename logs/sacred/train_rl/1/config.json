@@ -1,0 +1,74 @@
+{
+  "agent_path": null,
+  "environment": {
+    "env_make_kwargs": {},
+    "gym_id": "highway-ME-basic-v0",
+    "max_episode_steps": null,
+    "num_vec": 1,
+    "parallel": true
+  },
+  "load_reward_kwargs": {},
+  "logging": {
+    "log_dir": "logs/dqn_ME/highway_basic_2025-12-15T22:55:37.804623/",
+    "log_format_strs": [
+      "tensorboard",
+      "stdout"
+    ],
+    "log_format_strs_additional": {},
+    "log_level": 20,
+    "log_root": null,
+    "wandb": {
+      "wandb_additional_info": {},
+      "wandb_kwargs": {
+        "monitor_gym": false,
+        "project": "imitation",
+        "save_code": false
+      },
+      "wandb_name_prefix": "",
+      "wandb_tag": null
+    }
+  },
+  "normalize_kwargs": {},
+  "normalize_reward": false,
+  "policy": {
+    "policy_cls": {
+      "py/type": "stable_baselines3.dqn_ME.policies_ME.DQNPolicy"
+    },
+    "policy_kwargs": {
+      "net_arch": [
+        256,
+        256
+      ]
+    }
+  },
+  "policy_evaluation": {
+    "n_episodes_eval": 50
+  },
+  "policy_save_final": true,
+  "policy_save_interval": 10000,
+  "reward_path": null,
+  "reward_type": null,
+  "rl": {
+    "batch_size": 32,
+    "hyperparameter_directory": "/mnt/d/OneDrive - Tufts/RQL-Comparison/hyperparams",
+    "rl_cls": {
+      "py/type": "stable_baselines3.dqn_ME.dqn_ME.DQN_ME"
+    },
+    "rl_kwargs": {
+      "batch_size": null,
+      "buffer_size": 15000,
+      "exploration_fraction": 0.7,
+      "gamma": 0.8,
+      "gradient_steps": 1,
+      "learning_rate": 0.0001,
+      "learning_starts": 200,
+      "target_update_interval": 50,
+      "train_freq": 1
+    }
+  },
+  "rollout_save_final": true,
+  "rollout_save_n_episodes": 1000,
+  "rollout_save_n_timesteps": null,
+  "seed": 1,
+  "total_timesteps": 700000
+}

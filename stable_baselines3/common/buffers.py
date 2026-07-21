@@ -293,6 +293,9 @@ class ReplayBuffer(BaseBuffer):
         return self._get_samples(batch_inds, env=env)
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+        batch_inds = np.asarray(batch_inds, dtype=int)
+        if batch_inds.ndim == 0:
+            batch_inds = batch_inds[None]
         # Sample randomly the env idx
         env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
 
@@ -615,6 +618,9 @@ class DictReplayBuffer(ReplayBuffer):
         return super(ReplayBuffer, self).sample(batch_size=batch_size, env=env)
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> DictReplayBufferSamples:
+        batch_inds = np.asarray(batch_inds, dtype=int)
+        if batch_inds.ndim == 0:
+            batch_inds = batch_inds[None]
         # Sample randomly the env idx
         env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
 

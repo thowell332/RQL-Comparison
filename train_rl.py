@@ -2,17 +2,21 @@ import logging
 import pathlib
 import warnings
 from typing import Any, Mapping, Optional
+import zipfile
 
 import os
 import datetime
 import argparse
 import numpy as np
+
+# NumPy 2.x compatibility: some libraries still expect np.bool8
+if not hasattr(np, "bool8"):
+    np.bool8 = np.bool_
 import highway_env
 from sacred.observers import FileStorageObserver
 from stable_baselines3.common import callbacks
 from stable_baselines3.common.vec_env import VecNormalize
 
-import rl_zoo3.import_envs
 from imitation.data import rollout, types, wrappers
 from imitation.policies import serialize
 from imitation.rewards.reward_wrapper import RewardVecEnvWrapper
@@ -22,6 +26,50 @@ from imitation.scripts.ingredients import environment
 from imitation.scripts.ingredients import logging as logging_ingredient
 from imitation.scripts.ingredients import policy_evaluation, rl
 warnings.filterwarnings('ignore')
+
+
+def is_valid_checkpoint(checkpoint_path: pathlib.Path) -> bool:
+    """Check if a checkpoint file exists and is a valid zip file."""
+    if not checkpoint_path.exists():
+        return False
+    if not checkpoint_path.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(checkpoint_path, 'r') as zip_file:
+            # Try to read the zip file to verify it's valid
+            zip_file.testzip()
+        return True
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, IOError):
+        return False
+
+
+def find_latest_valid_checkpoint(policy_dir: pathlib.Path) -> Optional[pathlib.Path]:
+    """Find the latest valid checkpoint in a policy directory.
+    
+    Returns the path to the latest valid checkpoint, or None if none found.
+    """
+    if not policy_dir.exists():
+        return None
+    
+    # First, try numbered checkpoints (sorted by timestep, descending)
+    checkpoints = sorted(
+        [d for d in policy_dir.iterdir() if d.is_dir() and d.name.isdigit()],
+        key=lambda x: int(x.name),
+        reverse=True
+    )
+    
+    for checkpoint_dir in checkpoints:
+        checkpoint_file = checkpoint_dir / 'model.zip'
+        if is_valid_checkpoint(checkpoint_file):
+            return checkpoint_file
+    
+    # Fall back to 'final' checkpoint
+    final_checkpoint = policy_dir / 'final' / 'model.zip'
+    if is_valid_checkpoint(final_checkpoint):
+        return final_checkpoint
+    
+    return None
+
 
 @train_rl_ex.main
 def train_rl(
@@ -133,6 +181,44 @@ def train_rl(
             rl_algo = rl.make_rl_algo(venv)
         else:
             rl_algo = rl.load_rl_algo_from_path(agent_path=agent_path, venv=venv)
+            # For off-policy algorithms, always reinitialize the replay buffer when resuming
+            # This avoids corruption issues from saved checkpoints. The replay buffer will
+            # fill up naturally during training (SAC handles this with learning_starts parameter)
+            if hasattr(rl_algo, 'replay_buffer') and rl_algo.replay_buffer is not None:
+                from stable_baselines3.common.buffers import ReplayBuffer
+                # Get buffer parameters from the algorithm
+                buffer_size = getattr(rl_algo, 'buffer_size', 1000000)
+                optimize_memory_usage = getattr(rl_algo, 'optimize_memory_usage', False)
+                replay_buffer_kwargs = getattr(rl_algo, 'replay_buffer_kwargs', {})
+                
+                # Always reinitialize to avoid any corruption issues
+                # The buffer will fill up during training before learning starts
+                rl_algo.replay_buffer = ReplayBuffer(
+                    buffer_size=buffer_size,
+                    observation_space=venv.observation_space,
+                    action_space=venv.action_space,
+                    device=rl_algo.device,
+                    n_envs=venv.num_envs,
+                    optimize_memory_usage=optimize_memory_usage,
+                    **replay_buffer_kwargs
+                )
+                
+                # When resuming, we need to ensure learning doesn't start until buffer has samples
+                # Reset num_timesteps to 0 so learning_starts will be respected
+                # This ensures the buffer fills up before training begins
+                if hasattr(rl_algo, 'num_timesteps'):
+                    original_timesteps = rl_algo.num_timesteps
+                    rl_algo.num_timesteps = 0
+                    logging.info(
+                        f"Replay buffer reinitialized when resuming from checkpoint. "
+                        f"Reset num_timesteps from {original_timesteps} to 0 to ensure "
+                        f"buffer fills up before training starts (learning_starts={getattr(rl_algo, 'learning_starts', 'unknown')})."
+                    )
+                else:
+                    logging.info(
+                        "Replay buffer reinitialized when resuming from checkpoint. "
+                        "It will fill up during training before learning starts."
+                    )
         rl_algo.set_logger(custom_logger)
         rl_algo.learn(total_timesteps, callback=callback)
 
@@ -162,12 +248,59 @@ if __name__ == "__main__":
     parser.add_argument('--env-name', type=str, default='')
     parser.add_argument('--algo', type=str, default='sac') # sac, ppo, or dqn_ME
     parser.add_argument('--rollout-save-n-episodes', type=int, default=10)
-    parser.add_argument('--total-timesteps', type=int, default=-1) 
-    parser.add_argument('--agent-path', type=str, default='')
+    parser.add_argument('--total-timesteps', type=int, default=int(5e5)) 
+    parser.add_argument('--agent-path', type=str, default='',
+                        help='Path to a saved model checkpoint to resume training from. '
+                             'Can be a specific checkpoint (e.g., logs/sac/env_xxx/policies/000000100000/model.zip) '
+                             'or "latest" to automatically find the latest checkpoint from the most recent run.')
+    parser.add_argument('--resume-from-logdir', type=str, default='',
+                        help='Resume from the latest checkpoint in the specified log directory. '
+                             'Overrides --agent-path if both are provided.')
     args = parser.parse_args()
 
     if args.env_name == '':
         raise ValueError('Please specify the environment.')
+
+    # Handle resume logic
+    agent_path = args.agent_path
+    if args.resume_from_logdir:
+        # Find the latest checkpoint in the specified log directory
+        policy_dir = pathlib.Path(args.resume_from_logdir) / 'policies'
+        latest_checkpoint = find_latest_valid_checkpoint(policy_dir)
+        if latest_checkpoint:
+            agent_path = str(latest_checkpoint)
+            logging.info(f"Resuming from checkpoint: {agent_path}")
+        else:
+            raise ValueError(f"No valid checkpoint found in {policy_dir}")
+    elif args.agent_path == 'latest':
+        # Find the most recent run and use its latest checkpoint
+        algo_log_dir = pathlib.Path('logs') / args.algo
+        if algo_log_dir.exists():
+            # Find all directories matching the env name pattern
+            env_dirs = [d for d in algo_log_dir.iterdir() if d.is_dir() and args.env_name in d.name]
+            if env_dirs:
+                # Sort by modification time, get most recent
+                latest_dir = max(env_dirs, key=lambda d: d.stat().st_mtime)
+                policy_dir = latest_dir / 'policies'
+                latest_checkpoint = find_latest_valid_checkpoint(policy_dir)
+                if latest_checkpoint:
+                    agent_path = str(latest_checkpoint)
+                    logging.info(f"Resuming from latest checkpoint: {agent_path}")
+                else:
+                    raise ValueError(f"No valid checkpoint found in {policy_dir}")
+            else:
+                raise ValueError(f"No previous runs found for {args.env_name} in {algo_log_dir}")
+        else:
+            raise ValueError(f"Log directory not found: {algo_log_dir}")
+    elif agent_path != '':
+        # Validate the explicitly provided checkpoint path
+        checkpoint_path = pathlib.Path(agent_path)
+        if not is_valid_checkpoint(checkpoint_path):
+            raise ValueError(
+                f"Invalid checkpoint file: {agent_path}. "
+                f"The file does not exist or is not a valid zip file. "
+                f"Please check the path and ensure the checkpoint was saved correctly."
+            )
 
     now = datetime.datetime.now()
     timestamp = now.isoformat()
@@ -178,8 +311,8 @@ if __name__ == "__main__":
             'logging.log_dir': logdir,
             'rollout_save_n_episodes': args.rollout_save_n_episodes,
         }
-    if args.agent_path != '':
-        config_updates['agent_path'] = args.agent_path
+    if agent_path != '':
+        config_updates['agent_path'] = agent_path
     if args.total_timesteps != -1:
         config_updates['total_timesteps'] = args.total_timesteps
         
