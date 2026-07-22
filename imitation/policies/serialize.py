@@ -69,6 +69,13 @@ def load_stable_baselines_model(
             f"statistics from '{vec_normalize_path}'",
         )
 
+    # Gym space pickles are fragile across gym versions (e.g. 0.23 vs 0.26
+    # RandomNumberGenerator). Prefer the live env's spaces so resume still works.
+    custom_objects = dict(kwargs.pop("custom_objects", None) or {})
+    custom_objects.setdefault("observation_space", venv.observation_space)
+    custom_objects.setdefault("action_space", venv.action_space)
+    kwargs["custom_objects"] = custom_objects
+
     return cls.load(path_obj, env=venv, **kwargs)
 
 
