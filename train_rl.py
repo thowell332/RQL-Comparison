@@ -98,7 +98,9 @@ def train_rl(
         - Rollouts are saved to `{log_dir}/rollouts/{step}.npz`.
 
     Args:
-        total_timesteps: Number of training timesteps in `model.learn()`.
+        total_timesteps: Absolute timestep budget for the run. On resume, training
+            continues from the checkpoint's ``num_timesteps`` up to this target
+            (exploration schedule is preserved; ``reset_num_timesteps=False``).
         normalize_reward: Applies normalization and clipping to the reward function by
             keeping a running average of training rewards. Note: this is may be
             redundant if using a learned reward that is already normalized.
@@ -179,20 +181,18 @@ def train_rl(
 
         if agent_path is None:
             rl_algo = rl.make_rl_algo(venv)
+            rl_algo.set_logger(custom_logger)
+            rl_algo.learn(total_timesteps, callback=callback)
         else:
             rl_algo = rl.load_rl_algo_from_path(agent_path=agent_path, venv=venv)
-            # For off-policy algorithms, always reinitialize the replay buffer when resuming
-            # This avoids corruption issues from saved checkpoints. The replay buffer will
-            # fill up naturally during training (SAC handles this with learning_starts parameter)
-            if hasattr(rl_algo, 'replay_buffer') and rl_algo.replay_buffer is not None:
+            # Off-policy checkpoints often omit / corrupt the replay buffer. Reinit it,
+            # but keep num_timesteps so ε-greedy and the timestep budget continue.
+            if hasattr(rl_algo, "replay_buffer") and rl_algo.replay_buffer is not None:
                 from stable_baselines3.common.buffers import ReplayBuffer
-                # Get buffer parameters from the algorithm
-                buffer_size = getattr(rl_algo, 'buffer_size', 1000000)
-                optimize_memory_usage = getattr(rl_algo, 'optimize_memory_usage', False)
-                replay_buffer_kwargs = getattr(rl_algo, 'replay_buffer_kwargs', {})
-                
-                # Always reinitialize to avoid any corruption issues
-                # The buffer will fill up during training before learning starts
+
+                buffer_size = getattr(rl_algo, "buffer_size", 1000000)
+                optimize_memory_usage = getattr(rl_algo, "optimize_memory_usage", False)
+                replay_buffer_kwargs = getattr(rl_algo, "replay_buffer_kwargs", {})
                 rl_algo.replay_buffer = ReplayBuffer(
                     buffer_size=buffer_size,
                     observation_space=venv.observation_space,
@@ -200,27 +200,45 @@ def train_rl(
                     device=rl_algo.device,
                     n_envs=venv.num_envs,
                     optimize_memory_usage=optimize_memory_usage,
-                    **replay_buffer_kwargs
+                    **replay_buffer_kwargs,
                 )
-                
-                # When resuming, we need to ensure learning doesn't start until buffer has samples
-                # Reset num_timesteps to 0 so learning_starts will be respected
-                # This ensures the buffer fills up before training begins
-                if hasattr(rl_algo, 'num_timesteps'):
-                    original_timesteps = rl_algo.num_timesteps
-                    rl_algo.num_timesteps = 0
-                    logging.info(
-                        f"Replay buffer reinitialized when resuming from checkpoint. "
-                        f"Reset num_timesteps from {original_timesteps} to 0 to ensure "
-                        f"buffer fills up before training starts (learning_starts={getattr(rl_algo, 'learning_starts', 'unknown')})."
-                    )
-                else:
-                    logging.info(
-                        "Replay buffer reinitialized when resuming from checkpoint. "
-                        "It will fill up during training before learning starts."
-                    )
-        rl_algo.set_logger(custom_logger)
-        rl_algo.learn(total_timesteps, callback=callback)
+
+                min_buffer = max(int(getattr(rl_algo, "batch_size", 32)), 1000)
+                original_train = rl_algo.train
+
+                def train_after_buffer_refill(gradient_steps: int, batch_size: int = 100) -> None:
+                    buf = rl_algo.replay_buffer
+                    n_transitions = buf.buffer_size if buf.full else buf.pos
+                    if n_transitions < min_buffer:
+                        return
+                    return original_train(gradient_steps, batch_size)
+
+                rl_algo.train = train_after_buffer_refill
+                logging.info(
+                    "Replay buffer reinitialized on resume "
+                    f"(num_timesteps={rl_algo.num_timesteps} kept; "
+                    f"gradient updates deferred until buffer has >= {min_buffer} samples)."
+                )
+
+            remaining = max(0, int(total_timesteps) - int(rl_algo.num_timesteps))
+            logging.info(
+                f"Resuming learn: num_timesteps={rl_algo.num_timesteps}, "
+                f"target={total_timesteps}, remaining={remaining} "
+                "(reset_num_timesteps=False so exploration schedule continues)."
+            )
+            rl_algo.set_logger(custom_logger)
+            if remaining == 0:
+                logging.info(
+                    "Checkpoint already at or past --total-timesteps; skipping learn()."
+                )
+            else:
+                # remaining is additional steps; SB3 adds current num_timesteps when
+                # reset_num_timesteps=False so _total_timesteps stays the absolute target.
+                rl_algo.learn(
+                    remaining,
+                    callback=callback,
+                    reset_num_timesteps=False,
+                )
 
         # Save final artifacts after training is complete.
         if rollout_save_final:
