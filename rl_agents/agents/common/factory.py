@@ -2,7 +2,9 @@ import copy
 import importlib
 import json
 import logging
+
 import gym
+import numpy as np
 
 from rl_agents.configuration import Configurable
 
@@ -116,19 +118,56 @@ def preprocess_env(env, preprocessor_configs):
     return env
 
 
-def safe_deepcopy_env(obj):
+def _clone_numpy_rng(rng):
+    """Clone a NumPy Generator without using broken Generator pickle/deepcopy paths."""
+    if rng is None:
+        return None
+    bit_generator = rng.bit_generator
+    new_bit_generator = bit_generator.__class__()
+    new_bit_generator.state = copy.deepcopy(bit_generator.state)
+    # Preserve gym's RandomNumberGenerator subclass when present.
+    return type(rng)(new_bit_generator)
+
+
+def _safe_deepcopy(value, memo):
+    """Deep-copy a value, special-casing gym envs and NumPy RNGs."""
+    if isinstance(value, gym.Env):
+        return safe_deepcopy_env(value, memo=memo)
+    if isinstance(value, np.random.Generator):
+        return _clone_numpy_rng(value)
+    try:
+        return copy.deepcopy(value, memo=memo)
+    except TypeError:
+        # Nested gym Space / wrapper objects may embed an un-copyable RNG.
+        if hasattr(value, "__dict__"):
+            cls = value.__class__
+            result = cls.__new__(cls)
+            memo[id(value)] = result
+            for key, item in value.__dict__.items():
+                setattr(result, key, _safe_deepcopy(item, memo))
+            return result
+        raise
+
+
+def safe_deepcopy_env(obj, memo=None):
     """
         Perform a deep copy of an environment but without copying its viewer.
+
+    NumPy>=1.24 changed Generator pickling in a way that breaks copy.deepcopy on
+    gym's RandomNumberGenerator; we clone RNGs explicitly instead.
     """
+    if memo is None:
+        memo = {}
+    obj_id = id(obj)
+    if obj_id in memo:
+        return memo[obj_id]
+
     cls = obj.__class__
     result = cls.__new__(cls)
-    memo = {id(obj): result}
+    memo[obj_id] = result
     for k, v in obj.__dict__.items():
         if k not in ['viewer', '_monitor', 'grid_render', 'video_recorder', '_record_video_wrapper']:
-            if isinstance(v, gym.Env):
-                setattr(result, k, safe_deepcopy_env(v))
-            else:
-                setattr(result, k, copy.deepcopy(v, memo=memo))
+            setattr(result, k, _safe_deepcopy(v, memo))
         else:
             setattr(result, k, None)
     return result
