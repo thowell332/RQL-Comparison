@@ -203,7 +203,10 @@ def train_rl(
                     **replay_buffer_kwargs,
                 )
 
-                min_buffer = max(int(getattr(rl_algo, "batch_size", 32)), 1000)
+                batch_size = getattr(rl_algo, "batch_size", None)
+                if batch_size is None:
+                    batch_size = 32
+                min_buffer = max(int(batch_size), 1000)
                 original_train = rl_algo.train
 
                 def train_after_buffer_refill(gradient_steps: int, batch_size: int = 100) -> None:
