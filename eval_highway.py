@@ -12,7 +12,7 @@ from supervisor import DiscreteSupervisor
 import torch as th
 
 # Match norm-supervised-highway/scripts/base_experiment.py
-BASE_SEED = 239
+BASE_SEED = 42
 
 
 def episode_seed(base_seed: int, episode: int) -> int:
@@ -28,7 +28,7 @@ def evaluation(model, env_name="highway-ME-basic-AddRightRewardALL-v0", n_steps=
         env_name: Environment to evaluate on
         n_steps: Number of steps to run evaluation (if None, use n_episodes)
         n_episodes: Number of episodes to run evaluation (if None, use n_steps)
-        seed: Base random seed (default 239, matching norm-supervised-highway BASE_SEED).
+        seed: Base random seed (default 42, matching norm-supervised-highway BASE_SEED).
             Each episode i is reset with seed = seed + i.
         safe_decide: If True, select actions via DiscreteSupervisor.decide with
             enforce_constraints=True (hard permissibility mask) instead of raw
