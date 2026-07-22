@@ -3,6 +3,7 @@ from gym.envs.registration import register
 
 from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
+from highway_env.envs.common.action import Action
 from highway_env.road.lane import LineType, StraightLane, SineLane
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.controller import ControlledVehicle
@@ -28,6 +29,7 @@ class MergeEnv(AbstractEnv):
             "high_speed_reward": 0.2,
             "merging_speed_reward": -0.5,
             "lane_change_reward": -0.05,
+            "reward_speed_range": [20, 30],
         })
         return cfg
 
@@ -124,7 +126,61 @@ class MergeEnv(AbstractEnv):
         self.vehicle = ego_vehicle
 
 
+class MergeEnvMEBasic(MergeEnv):
+    """
+    Merge counterpart of HighwayEnvMEBasic for the first-experiment reward setup:
+        - lower simulation frequency
+        - collision + high speed + right-lane + constant offset
+        - no merging-speed altruism or lane-change cost
+        - no [0, 1] lmap (same raw-scale +1 formula as HighwayEnvMEBasic)
+    """
+
+    @classmethod
+    def default_config(cls) -> dict:
+        cfg = super().default_config()
+        cfg.update({
+            "simulation_frequency": 5,
+            "collision_reward": -0.5,
+            "right_lane_reward": 0.1,
+            "high_speed_reward": 0.4,
+            "merging_speed_reward": 0.0,
+            "lane_change_reward": 0,
+            "reward_speed_range": [20, 30],
+        })
+        return cfg
+
+    def _reward(self, action: Action) -> float:
+        """
+        Match HighwayEnvMEBasic (no lmap to [0, 1]):
+            collision_reward * crashed
+            + right_lane_reward * lane_fraction
+            + high_speed_reward * clip(lmap(forward_speed, reward_speed_range, [0, 1]), 0, 1)
+            + 1
+        Zero when off-road. Merging altruism / lane-change terms are excluded.
+        """
+        del action  # unused; DiscreteMetaAction reward does not depend on action here
+        neighbours = self.road.network.all_side_lanes(self.vehicle.lane_index)
+        lane = self.vehicle.target_lane_index[2] if isinstance(self.vehicle, ControlledVehicle) \
+            else self.vehicle.lane_index[2]
+        lane_fraction = lane / max(len(neighbours) - 1, 1)
+
+        forward_speed = self.vehicle.speed * np.cos(self.vehicle.heading)
+        scaled_speed = utils.lmap(forward_speed, self.config["reward_speed_range"], [0, 1])
+        reward = (
+            self.config["collision_reward"] * self.vehicle.crashed
+            + self.config["right_lane_reward"] * lane_fraction
+            + self.config["high_speed_reward"] * np.clip(scaled_speed, 0, 1)
+            + 1
+        )
+        return 0 if not self.vehicle.on_road else reward
+
+
 register(
     id='merge-v0',
     entry_point='highway_env.envs:MergeEnv',
+)
+
+register(
+    id='merge-ME-basic-v0',
+    entry_point='highway_env.envs:MergeEnvMEBasic',
 )

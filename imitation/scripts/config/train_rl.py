@@ -183,6 +183,13 @@ def highway_total():
     policy = dict(policy_kwargs=dict(net_arch=[256, 256]))
 
 
+@train_rl_ex.named_config
+def merge_basic():
+    environment = dict(gym_id="merge-ME-basic-v0", num_vec=1)
+    total_timesteps = int(7e5)
+    policy = dict(policy_kwargs=dict(net_arch=[256, 256]))
+
+
 # Debug configs
 @train_rl_ex.named_config
 def fast():

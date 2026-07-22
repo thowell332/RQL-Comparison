@@ -23,11 +23,17 @@ pip install -r requirements.txt
 Run the script `train_rl.py` with arguments specifying the ennvironment, algorithm, and the number of expert rollouts collected in the final iteration which will be used for GAIL training. For example:
 ```
 python train_rl.py --env-name highway_basic --algo dqn_ME --rollout-save-n-episodes 1000
+python train_rl.py --env-name merge_basic --algo dqn_ME --rollout-save-n-episodes 1000
 python train_rl.py --env-name parking_basic --algo sac --rollout-save-n-episodes 10000
 python train_rl.py --env-name cartpole_basic --algo dqn_ME --rollout-save-n-episodes 1000
 python train_rl.py --env-name mountain_car_basic --algo sac --rollout-save-n-episodes 10000
 ```
 The experiment will be logged in the directory in the format of `logs/{algo}/{env-name}_{timestamp}/`. The policies are stored in the subfolder `policies` and the final rollouts are stored in the subfolder `rollouts`. 
+
+For a standalone SB3 training script on merge (same hyperparameters as highway basic), see `trainin_demo_merge.py`:
+```
+python trainin_demo_merge.py --total-timesteps 500000 --eval
+``` 
 
 ## Training IL prior agents
 Run the script `train_gail.py` with arguments specifying the ennvironment, generator training algorithm, and the directory of the demo rollouts. For example:

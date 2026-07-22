@@ -11,6 +11,8 @@ import highway_env
 from supervisor import DiscreteSupervisor
 import torch as th
 
+from basic_reward import compute_basic_reward, load_basic_reward_config
+
 # Match norm-supervised-highway/scripts/base_experiment.py
 BASE_SEED = 42
 
@@ -62,6 +64,10 @@ def evaluation(model, env_name="highway-ME-basic-AddRightRewardALL-v0", n_steps=
             for key, value in env_config.items():
                 if key in getattr(env, "config", {}):
                     env.config[key] = value
+
+    # Training-aligned basic reward (HighwayEnvMEBasic / highway_basic), independent of
+    # whatever right-lane add-on the evaluation env uses.
+    basic_reward_config = load_basic_reward_config()
 
     # Match test_highway.py: model RNG fixed to base seed; env reseeded per episode.
     target_episodes = n_episodes if n_episodes is not None else None
@@ -131,14 +137,23 @@ def evaluation(model, env_name="highway-ME-basic-AddRightRewardALL-v0", n_steps=
         
         forward_speed = env.vehicle.speed * np.cos(env.vehicle.heading)
         episode_speed = episode_speed + forward_speed
-        
-        # Try to get basic/added rewards if available (for AddRightRewardALL env)
+
+        # Basic: RQL training coeffs. Added: right-lane bonus from the eval env when present.
+        basic_reward += compute_basic_reward(
+            forward_speed=forward_speed,
+            crashed=bool(env.vehicle.crashed),
+            on_road=bool(env.vehicle.on_road),
+            config=basic_reward_config,
+        )
         try:
-            basic_reward += env.basic_reward
             added_reward += env.added_reward
         except AttributeError:
-            pass
-        
+            right_lane_reward = env.unwrapped.config.get("right_lane_reward", 0.0)
+            step_added = right_lane_reward * lane
+            if not env.vehicle.on_road:
+                step_added = 0.0
+            added_reward += step_added
+
         episode_reward += reward
         ep_len += 1
         

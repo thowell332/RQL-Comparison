@@ -26,10 +26,11 @@ from pathlib import Path
 import gym
 import highway_env  # noqa: F401  # registers highway environments
 import numpy as np
-from highway_env import utils
 from highway_env.vehicle.controller import ControlledVehicle
 from rl_agents.agents.common.factory import load_agent
 from supervisor import DiscreteSupervisor
+
+from basic_reward import compute_basic_reward, load_basic_reward_config
 
 
 # Suppress noisy warnings, as in the notebook
@@ -193,6 +194,7 @@ def evaluation(
     episode_norm_cost = 0.0
     ep_len = 0
     episode_count = start_episode
+    basic_reward_config = load_basic_reward_config()
 
     def reset_episode(episode_idx: int):
         """Seed and reset env for the given episode (gym API; seed before reset)."""
@@ -263,19 +265,14 @@ def evaluation(
         episode_reward += reward
         ep_len += 1
 
-        scaled_speed = utils.lmap(
-            forward_speed, env.config["reward_speed_range"], [0, 1]
+        # Basic reward uses RQL highway_basic / HighwayEnvMEBasic training coeffs
+        # (configs/HighwayEnv/basic_reward.json), not the live AddRightReward env shaping.
+        total_reward += compute_basic_reward(
+            forward_speed=forward_speed,
+            crashed=bool(env.vehicle.crashed),
+            on_road=bool(env.vehicle.on_road),
+            config=basic_reward_config,
         )
-
-        reward = (
-            (-0.5) * env.vehicle.crashed
-            + 0.0 * lane
-            + 0.4 * np.clip(scaled_speed, 0, 1)
-            + 1
-        )
-        reward = 0 if not env.vehicle.on_road else reward
-
-        total_reward += reward
 
         if done:
             success = 1 if ep_len == 40 else 0
