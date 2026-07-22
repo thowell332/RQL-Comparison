@@ -12,16 +12,23 @@ filtered out inside Residual MCTS prior/rollout so the returned plan already
 conforms to hard constraints.
 
 Episode metrics are written incrementally to ``--output`` (CSV). Re-running with
-the same output path resumes after the highest completed ``episode_id``, using
-``seed + episode_id`` so unfinished work continues with the correct RNG stream.
+the same output path resumes unfinished ``episode_id``s, using ``seed + episode_id``
+so unfinished work continues with the correct RNG stream.
+
+Use ``--n-workers`` to run independent episodes in parallel across CPU cores
+(default: all logical CPUs). ``--n-workers 1`` preserves serial behavior.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
+from typing import Any
 
 import gym
 import highway_env  # noqa: F401  # registers highway environments
@@ -50,6 +57,9 @@ CSV_FIELDS = [
     "mean_lane",
     "total_norm_cost",
 ]
+
+# Per-process state for parallel workers (set by _init_worker).
+_WORKER: dict[str, Any] = {}
 
 
 def episode_seed(base_seed: int, episode: int) -> int:
@@ -80,8 +90,12 @@ def make_permissibility_action_filter(supervisor: DiscreteSupervisor):
     return action_filter
 
 
-def load_completed_episodes(output_path: Path) -> tuple[int, dict[str, list]]:
-    """Load prior CSV rows for resume. Returns (next_episode_idx, metric lists)."""
+def load_completed_episodes(output_path: Path) -> tuple[set[int], dict[str, list]]:
+    """Load prior CSV rows for resume.
+
+    Returns (completed_episode_ids, metric lists). Metric lists follow CSV row
+    order; callers may sort by episode_id when summarizing.
+    """
     metrics = {
         "successes": [],
         "episode_rewards": [],
@@ -90,24 +104,28 @@ def load_completed_episodes(output_path: Path) -> tuple[int, dict[str, list]]:
         "episode_speeds": [],
         "episode_lanes": [],
         "episode_total_norm_costs": [],
+        "episode_ids": [],
     }
+    completed: set[int] = set()
     if not output_path.is_file() or output_path.stat().st_size == 0:
-        return 0, metrics
+        return completed, metrics
 
     with output_path.open("r", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
-            return 0, metrics
+            return completed, metrics
         missing = [field for field in ("episode_id",) if field not in reader.fieldnames]
         if missing:
             raise ValueError(
                 f"Output CSV {output_path} is missing required columns: {missing}"
             )
 
-        max_episode_id = -1
         for row in reader:
             episode_id = int(row["episode_id"])
-            max_episode_id = max(max_episode_id, episode_id)
+            if episode_id in completed:
+                continue
+            completed.add(episode_id)
+            metrics["episode_ids"].append(episode_id)
             metrics["successes"].append(int(float(row["success"])))
             metrics["episode_rewards"].append(float(row["episode_reward"]))
             metrics["episode_total_rewards"].append(float(row["basic_reward"]))
@@ -116,7 +134,7 @@ def load_completed_episodes(output_path: Path) -> tuple[int, dict[str, list]]:
             metrics["episode_lanes"].append(float(row["mean_lane"]))
             metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
 
-    return max_episode_id + 1, metrics
+    return completed, metrics
 
 
 def append_episode_row(output_path: Path, row: dict) -> None:
@@ -131,61 +149,27 @@ def append_episode_row(output_path: Path, row: dict) -> None:
         handle.flush()
 
 
-def evaluation(
+def _seed_episode(env, agent, base_seed: int, episode_idx: int):
+    """Seed env/agent and reset for the given episode index."""
+    ep_seed = episode_seed(base_seed, episode_idx)
+    env.seed(ep_seed)
+    env.action_space.seed(ep_seed)
+    if hasattr(agent, "seed"):
+        agent.seed(ep_seed)
+    return env.reset(), ep_seed
+
+
+def run_single_episode(
     agent,
     env,
-    n_episodes,
-    seed=BASE_SEED,
-    safe_decide=False,
-    output_path: Path | None = None,
-    resume: bool = True,
-):
-    """Evaluate an MCTS agent online for a fixed number of episodes.
-
-    Env is reseeded each episode as seed + episode_index.
-    When safe_decide is True, agent.planner.action_filter restricts expand/rollout
-    to the supervisor's min-violation permissible set at each search state.
-    When output_path is set, each finished episode is flushed to CSV immediately.
-    """
-    start_episode = 0
-    if output_path is not None and resume:
-        start_episode, prior = load_completed_episodes(output_path)
-        successes = prior["successes"]
-        episode_rewards = prior["episode_rewards"]
-        episode_total_rewards = prior["episode_total_rewards"]
-        episode_lengths = prior["episode_lengths"]
-        episode_speeds = prior["episode_speeds"]
-        episode_lanes = prior["episode_lanes"]
-        episode_total_norm_costs = prior["episode_total_norm_costs"]
-    else:
-        successes = []
-        episode_rewards = []
-        episode_total_rewards = []
-        episode_lengths = []
-        episode_speeds = []
-        episode_lanes = []
-        episode_total_norm_costs = []
-
-    if start_episode >= n_episodes:
-        print(
-            f"Nothing to do: {start_episode} episode(s) already saved "
-            f"(requested {n_episodes})."
-        )
-        _print_summary(
-            successes,
-            episode_rewards,
-            episode_lengths,
-            episode_lanes,
-            episode_speeds,
-            episode_total_norm_costs,
-        )
-        return
-
-    if start_episode > 0:
-        print(
-            f"Resuming from episode {start_episode} "
-            f"({start_episode} row(s) already in {output_path})"
-        )
+    supervisor: DiscreteSupervisor,
+    episode_idx: int,
+    seed: int,
+    basic_reward_config: dict,
+) -> dict:
+    """Run one MCTS episode and return a CSV-ready metrics row."""
+    obs, ep_seed = _seed_episode(env, agent, seed, episode_idx)
+    supervisor.reset_norms()
 
     episode_lane = 0.0
     episode_speed = 0.0
@@ -193,20 +177,72 @@ def evaluation(
     total_reward = 0.0
     episode_norm_cost = 0.0
     ep_len = 0
-    episode_count = start_episode
-    basic_reward_config = load_basic_reward_config()
+    done = False
 
-    def reset_episode(episode_idx: int):
-        """Seed and reset env for the given episode (gym API; seed before reset)."""
-        ep_seed = episode_seed(seed, episode_idx)
-        env.seed(ep_seed)
-        env.action_space.seed(ep_seed)
-        if hasattr(agent, "seed"):
-            agent.seed(ep_seed)
-        return env.reset()
+    while not done:
+        actions = agent.plan(obs)
+        base_action = int(actions[0])
 
-    obs = reset_episode(episode_count)
+        realized_cost = supervisor.get_norm_violation_cost([base_action])[0].item()
+        episode_norm_cost += realized_cost
 
+        obs, reward, done, _infos = env.step(base_action)
+
+        neighbours = env.road.network.all_side_lanes(env.vehicle.lane_index)
+        lane = (
+            env.vehicle.target_lane_index[2]
+            if isinstance(env.vehicle, ControlledVehicle)
+            else env.vehicle.lane_index[2]
+        )
+        lane = lane / max(len(neighbours) - 1, 1)
+        episode_lane += lane
+
+        forward_speed = env.vehicle.speed * np.cos(env.vehicle.heading)
+        episode_speed += forward_speed
+        episode_reward += reward
+        ep_len += 1
+
+        total_reward += compute_basic_reward(
+            forward_speed=forward_speed,
+            crashed=bool(env.vehicle.crashed),
+            on_road=bool(env.vehicle.on_road),
+            config=basic_reward_config,
+        )
+
+    return {
+        "episode_id": episode_idx,
+        "seed": ep_seed,
+        "success": 1 if ep_len == 40 else 0,
+        "episode_length": ep_len,
+        "episode_reward": episode_reward,
+        "basic_reward": total_reward,
+        "mean_speed": episode_speed / ep_len,
+        "mean_lane": episode_lane / ep_len,
+        "total_norm_cost": episode_norm_cost,
+    }
+
+
+def _configure_agent_filter(agent, supervisor: DiscreteSupervisor, safe_decide: bool) -> None:
+    if safe_decide:
+        if not hasattr(agent, "planner") or not hasattr(agent.planner, "action_filter"):
+            raise RuntimeError(
+                "--safe-decide requires Residual MCTS (MCTSME) with action_filter support"
+            )
+        agent.planner.action_filter = make_permissibility_action_filter(supervisor)
+    elif hasattr(agent, "planner") and hasattr(agent.planner, "action_filter"):
+        agent.planner.action_filter = None
+
+
+def _init_worker(
+    env_name: str,
+    agent_config: str,
+    safe_decide: bool,
+    seed: int,
+) -> None:
+    """Create env/agent/supervisor once per worker process."""
+    warnings.filterwarnings("ignore")
+    env = gym.make(env_name)
+    agent = load_agent(agent_config, env)
     supervisor = DiscreteSupervisor(
         env=env.unwrapped,
         profile_name="right_lane",
@@ -216,141 +252,204 @@ def evaluation(
         kl_budget=None,
         verbose=False,
     )
-    supervisor.reset_norms()
+    _configure_agent_filter(agent, supervisor, safe_decide)
+    _WORKER["env"] = env
+    _WORKER["agent"] = agent
+    _WORKER["supervisor"] = supervisor
+    _WORKER["seed"] = seed
+    _WORKER["basic_reward_config"] = load_basic_reward_config()
+    _WORKER["safe_decide"] = safe_decide
 
-    if safe_decide:
-        if not hasattr(agent, "planner") or not hasattr(agent.planner, "action_filter"):
-            raise RuntimeError(
-                "--safe-decide requires Residual MCTS (MCTSME) with action_filter support"
-            )
-        agent.planner.action_filter = make_permissibility_action_filter(supervisor)
-        print("Safe decide: filtering MCTS prior/rollout with supervisor permissibility mask")
-    else:
-        if hasattr(agent, "planner") and hasattr(agent.planner, "action_filter"):
-            agent.planner.action_filter = None
 
-    print(
-        f"Base seed = {seed}, "
-        f"episode {episode_count} seed = {episode_seed(seed, episode_count)}"
+def _worker_run_episode(episode_idx: int) -> dict:
+    """Run one episode in a worker using process-local env/agent."""
+    return run_single_episode(
+        agent=_WORKER["agent"],
+        env=_WORKER["env"],
+        supervisor=_WORKER["supervisor"],
+        episode_idx=episode_idx,
+        seed=_WORKER["seed"],
+        basic_reward_config=_WORKER["basic_reward_config"],
     )
+
+
+def _record_row(metrics: dict[str, list], row: dict) -> None:
+    metrics["episode_ids"].append(int(row["episode_id"]))
+    metrics["successes"].append(int(row["success"]))
+    metrics["episode_rewards"].append(float(row["episode_reward"]))
+    metrics["episode_total_rewards"].append(float(row["basic_reward"]))
+    metrics["episode_lengths"].append(int(row["episode_length"]))
+    metrics["episode_speeds"].append(float(row["mean_speed"]))
+    metrics["episode_lanes"].append(float(row["mean_lane"]))
+    metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
+
+
+def _print_progress(metrics: dict[str, list]) -> None:
+    successes = metrics["successes"]
+    episode_rewards = metrics["episode_rewards"]
+    episode_total_rewards = metrics["episode_total_rewards"]
+    episode_lengths = metrics["episode_lengths"]
+    episode_lanes = metrics["episode_lanes"]
+    episode_speeds = metrics["episode_speeds"]
+    episode_total_norm_costs = metrics["episode_total_norm_costs"]
+
+    print(f"Success rate: {100 * np.mean(successes):.2f}%")
+    print(f"{len(successes)} Episodes")
+    print(f"Last episode total norm cost: {episode_total_norm_costs[-1]:.2f}")
+    print(
+        f"Mean added reward: {np.mean(episode_rewards):.2f} "
+        f"+/- {np.std(episode_rewards):.2f}"
+    )
+    print(
+        f"Mean basic reward: {np.mean(episode_total_rewards):.2f} "
+        f"+/- {np.std(episode_total_rewards):.2f}"
+    )
+    print(
+        f"Mean episode length: {np.mean(episode_lengths):.2f} "
+        f"+/- {np.std(episode_lengths):.2f}"
+    )
+    print(
+        f"Mean lane: {np.mean(episode_lanes):.2f} "
+        f"+/- {np.std(episode_lanes):.2f}"
+    )
+    print(
+        f"Mean speed: {np.mean(episode_speeds):.2f} "
+        f"+/- {np.std(episode_speeds):.2f}"
+    )
+    print("-----------")
+
+
+def evaluation(
+    env_name: str,
+    agent_config: str,
+    n_episodes: int,
+    seed: int = BASE_SEED,
+    safe_decide: bool = False,
+    output_path: Path | None = None,
+    resume: bool = True,
+    n_workers: int = 1,
+):
+    """Evaluate an MCTS agent online for a fixed number of episodes.
+
+    Env is reseeded each episode as seed + episode_index.
+    When safe_decide is True, agent.planner.action_filter restricts expand/rollout
+    to the supervisor's min-violation permissible set at each search state.
+    When output_path is set, each finished episode is flushed to CSV immediately.
+    When n_workers > 1, unfinished episodes run in a process pool.
+    """
+    completed: set[int] = set()
+    if output_path is not None and resume:
+        completed, metrics = load_completed_episodes(output_path)
+    else:
+        metrics = {
+            "successes": [],
+            "episode_rewards": [],
+            "episode_total_rewards": [],
+            "episode_lengths": [],
+            "episode_speeds": [],
+            "episode_lanes": [],
+            "episode_total_norm_costs": [],
+            "episode_ids": [],
+        }
+
+    remaining = [i for i in range(n_episodes) if i not in completed]
+    if not remaining:
+        print(
+            f"Nothing to do: {len(completed)} episode(s) already saved "
+            f"(requested {n_episodes})."
+        )
+        _print_summary(
+            metrics["successes"],
+            metrics["episode_rewards"],
+            metrics["episode_lengths"],
+            metrics["episode_lanes"],
+            metrics["episode_speeds"],
+            metrics["episode_total_norm_costs"],
+        )
+        return
+
+    if completed:
+        print(
+            f"Resuming: {len(completed)} episode(s) done, "
+            f"{len(remaining)} remaining -> {output_path}"
+        )
+
+    print(f"Base seed = {seed}")
     print(f"Safe decide (in-tree filter) = {safe_decide}")
+    print(f"Workers = {n_workers}")
     if output_path is not None:
         print(f"Writing episode results to {output_path}")
 
-    while episode_count < n_episodes:
-        actions = agent.plan(obs)
-        action = actions[0]
-        base_action = int(action)
+    agent_config = str(Path(agent_config).expanduser().resolve())
 
-        # Compute realized norm violation cost for the chosen action using the supervisor cost oracle
-        realized_cost = supervisor.get_norm_violation_cost([base_action])[0].item()
-        episode_norm_cost += realized_cost
-
-        obs, reward, done, infos = env.step(base_action)
-
-        neighbours = env.road.network.all_side_lanes(env.vehicle.lane_index)
-        lane = (
-            env.vehicle.target_lane_index[2]
-            if isinstance(env.vehicle, ControlledVehicle)
-            else env.vehicle.lane_index[2]
+    if n_workers <= 1:
+        env = gym.make(env_name)
+        agent = load_agent(agent_config, env)
+        supervisor = DiscreteSupervisor(
+            env=env.unwrapped,
+            profile_name="right_lane",
+            method="nop",
+            enforce_constraints=safe_decide,
+            fixed_beta=None,
+            kl_budget=None,
+            verbose=False,
         )
-        lane = lane / max(len(neighbours) - 1, 1)
+        _configure_agent_filter(agent, supervisor, safe_decide)
+        if safe_decide:
+            print(
+                "Safe decide: filtering MCTS prior/rollout with supervisor "
+                "permissibility mask"
+            )
+        basic_reward_config = load_basic_reward_config()
 
-        episode_lane = episode_lane + lane
-
-        forward_speed = env.vehicle.speed * np.cos(env.vehicle.heading)
-
-        episode_speed = episode_speed + forward_speed
-
-        episode_reward += reward
-        ep_len += 1
-
-        # Basic reward uses RQL highway_basic / HighwayEnvMEBasic training coeffs
-        # (configs/HighwayEnv/basic_reward.json), not the live AddRightReward env shaping.
-        total_reward += compute_basic_reward(
-            forward_speed=forward_speed,
-            crashed=bool(env.vehicle.crashed),
-            on_road=bool(env.vehicle.on_road),
-            config=basic_reward_config,
-        )
-
-        if done:
-            success = 1 if ep_len == 40 else 0
-            mean_speed = episode_speed / ep_len
-            mean_lane = episode_lane / ep_len
-
-            successes.append(success)
-            episode_speeds.append(mean_speed)
-            episode_lanes.append(mean_lane)
-            episode_rewards.append(episode_reward)
-            episode_total_rewards.append(total_reward)
-            episode_lengths.append(ep_len)
-            episode_total_norm_costs.append(episode_norm_cost)
-
+        for episode_idx in remaining:
+            print(f"Episode {episode_idx} seed = {episode_seed(seed, episode_idx)}")
+            row = run_single_episode(
+                agent=agent,
+                env=env,
+                supervisor=supervisor,
+                episode_idx=episode_idx,
+                seed=seed,
+                basic_reward_config=basic_reward_config,
+            )
+            _record_row(metrics, row)
             if output_path is not None:
-                append_episode_row(
-                    output_path,
-                    {
-                        "episode_id": episode_count,
-                        "seed": episode_seed(seed, episode_count),
-                        "success": success,
-                        "episode_length": ep_len,
-                        "episode_reward": episode_reward,
-                        "basic_reward": total_reward,
-                        "mean_speed": mean_speed,
-                        "mean_lane": mean_lane,
-                        "total_norm_cost": episode_norm_cost,
-                    },
-                )
-
-            episode_reward = 0.0
-            total_reward = 0.0
-            ep_len = 0
-            episode_speed = 0.0
-            episode_lane = 0.0
-            episode_norm_cost = 0.0
-
-            episode_count += 1
-
-            print(f"Success rate: {100 * np.mean(successes):.2f}%")
-            print(f"{len(successes)} Episodes")
-            # Per-episode norm violation cost (total over the most recent episode)
+                append_episode_row(output_path, row)
+            _print_progress(metrics)
+        env.close()
+    else:
+        if safe_decide:
             print(
-                f"Last episode total norm cost: {episode_total_norm_costs[-1]:.2f}"
+                "Safe decide: filtering MCTS prior/rollout with supervisor "
+                "permissibility mask (per worker)"
             )
-            print(
-                f"Mean added reward: {np.mean(episode_rewards):.2f} "
-                f"+/- {np.std(episode_rewards):.2f}"
-            )
-            print(
-                f"Mean basic reward: {np.mean(episode_total_rewards):.2f} "
-                f"+/- {np.std(episode_total_rewards):.2f}"
-            )
-            print(
-                f"Mean episode length: {np.mean(episode_lengths):.2f} "
-                f"+/- {np.std(episode_lengths):.2f}"
-            )
-            print(
-                f"Mean lane: {np.mean(episode_lanes):.2f} "
-                f"+/- {np.std(episode_lanes):.2f}"
-            )
-            print(
-                f"Mean speed: {np.mean(episode_speeds):.2f} "
-                f"+/- {np.std(episode_speeds):.2f}"
-            )
-            print("-----------")
-
-            if episode_count < n_episodes:
-                obs = reset_episode(episode_count)
-                supervisor.reset_norms()
+        ctx = get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(env_name, agent_config, safe_decide, seed),
+        ) as executor:
+            futures = {
+                executor.submit(_worker_run_episode, episode_idx): episode_idx
+                for episode_idx in remaining
+            }
+            for future in as_completed(futures):
+                episode_idx = futures[future]
+                row = future.result()
+                _record_row(metrics, row)
+                if output_path is not None:
+                    append_episode_row(output_path, row)
+                print(f"Completed episode {episode_idx} (seed={row['seed']})")
+                _print_progress(metrics)
 
     _print_summary(
-        successes,
-        episode_rewards,
-        episode_lengths,
-        episode_lanes,
-        episode_speeds,
-        episode_total_norm_costs,
+        metrics["successes"],
+        metrics["episode_rewards"],
+        metrics["episode_lengths"],
+        metrics["episode_lanes"],
+        metrics["episode_speeds"],
+        metrics["episode_total_norm_costs"],
     )
 
 
@@ -394,6 +493,7 @@ def _print_summary(
 
 
 def main():
+    default_workers = os.cpu_count() or 1
     parser = argparse.ArgumentParser(
         description="Run Residual MCTS evaluation (notebook-equivalent)."
     )
@@ -440,25 +540,31 @@ def main():
         help="Ignore any existing --output CSV and start from episode 0 "
              "(will append duplicate episode_ids unless you delete the file).",
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=default_workers,
+        help=(
+            "Number of parallel worker processes for independent episodes "
+            f"(default: {default_workers} = os.cpu_count()). Use 1 for serial."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.n_workers < 1:
+        parser.error("--n-workers must be >= 1")
+
     output_path = Path(args.output).expanduser() if args.output else None
 
-    # Init env (same as notebook, but configurable)
-    env = gym.make(args.env_name)
-
-    # Load MCTS agent from config, as in the notebook
-    agent = load_agent(args.agent_config, env)
-
-    # Run evaluation (reseeds env/agent per episode)
     evaluation(
-        agent,
-        env,
-        args.n_episodes,
+        env_name=args.env_name,
+        agent_config=args.agent_config,
+        n_episodes=args.n_episodes,
         seed=args.seed,
         safe_decide=args.safe_decide,
         output_path=output_path,
         resume=not args.no_resume,
+        n_workers=args.n_workers,
     )
 
 
