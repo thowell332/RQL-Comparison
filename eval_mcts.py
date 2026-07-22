@@ -17,6 +17,10 @@ so unfinished work continues with the correct RNG stream.
 
 Use ``--n-workers`` to run independent episodes in parallel across CPU cores
 (default: all logical CPUs). ``--n-workers 1`` preserves serial behavior.
+
+Use ``--start-episode`` with ``--n-episodes`` to shard across machines: episode ids
+are ``[start_episode, n_episodes)`` (e.g. ``--start-episode 50 --n-episodes 100``
+runs 50–99). Each shard should write its own CSV, then concatenate.
 """
 
 from __future__ import annotations
@@ -328,6 +332,7 @@ def evaluation(
     output_path: Path | None = None,
     resume: bool = True,
     n_workers: int = 1,
+    start_episode: int = 0,
 ):
     """Evaluate an MCTS agent online for a fixed number of episodes.
 
@@ -336,7 +341,15 @@ def evaluation(
     to the supervisor's min-violation permissible set at each search state.
     When output_path is set, each finished episode is flushed to CSV immediately.
     When n_workers > 1, unfinished episodes run in a process pool.
+    Episode ids run in ``[start_episode, n_episodes)``.
     """
+    if start_episode < 0:
+        raise ValueError(f"start_episode must be >= 0, got {start_episode}")
+    if start_episode >= n_episodes:
+        raise ValueError(
+            f"start_episode ({start_episode}) must be < n_episodes ({n_episodes})"
+        )
+
     completed: set[int] = set()
     if output_path is not None and resume:
         completed, metrics = load_completed_episodes(output_path)
@@ -352,11 +365,11 @@ def evaluation(
             "episode_ids": [],
         }
 
-    remaining = [i for i in range(n_episodes) if i not in completed]
+    remaining = [i for i in range(start_episode, n_episodes) if i not in completed]
     if not remaining:
         print(
-            f"Nothing to do: {len(completed)} episode(s) already saved "
-            f"(requested {n_episodes})."
+            f"Nothing to do: shard [{start_episode}, {n_episodes}) already saved "
+            f"({len(completed)} episode(s) in CSV)."
         )
         _print_summary(
             metrics["successes"],
@@ -375,6 +388,7 @@ def evaluation(
         )
 
     print(f"Base seed = {seed}")
+    print(f"Episode id range = [{start_episode}, {n_episodes})")
     print(f"Safe decide (in-tree filter) = {safe_decide}")
     print(f"Workers = {n_workers}")
     if output_path is not None:
@@ -513,7 +527,16 @@ def main():
         "--n-episodes",
         type=int,
         default=10,
-        help="Number of episodes to run online MCTS for.",
+        help="Exclusive end of the episode id range (ids are "
+             "[--start-episode, --n-episodes)).",
+    )
+    parser.add_argument(
+        "--start-episode",
+        type=int,
+        default=0,
+        help="Inclusive start of the episode id range (default 0). "
+             "Use with --n-episodes to shard across machines, e.g. "
+             "--start-episode 50 --n-episodes 100 runs ids 50-99.",
     )
     parser.add_argument(
         "--seed",
@@ -553,6 +576,10 @@ def main():
     args = parser.parse_args()
     if args.n_workers < 1:
         parser.error("--n-workers must be >= 1")
+    if args.start_episode < 0:
+        parser.error("--start-episode must be >= 0")
+    if args.start_episode >= args.n_episodes:
+        parser.error("--start-episode must be < --n-episodes")
 
     output_path = Path(args.output).expanduser() if args.output else None
 
@@ -565,6 +592,7 @@ def main():
         output_path=output_path,
         resume=not args.no_resume,
         n_workers=args.n_workers,
+        start_episode=args.start_episode,
     )
 
 
