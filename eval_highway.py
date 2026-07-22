@@ -425,9 +425,10 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=BASE_SEED,
                         help=f'Base random seed (default {BASE_SEED}). '
                              'Each episode i uses seed + i')
-    parser.add_argument('--model-type', type=str, default='auto',
-                        choices=['auto', 'dqn_me', 'residual'],
-                        help='Model type: auto (detect), dqn_me, or residual')
+    parser.add_argument('--model-type', type=str, default='residual',
+                        choices=['residual', 'dqn_me'],
+                        help='Model type to load (default: residual). '
+                             'Fails hard if the requested type cannot be loaded.')
     parser.add_argument('--safe-decide', action='store_true',
                         help='Apply DiscreteSupervisor.decide with hard constraints '
                              '(permissibility mask) before env.step')
@@ -459,29 +460,24 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
     
     print(f"Loading model from: {model_path}")
+    print(f"Requested model type: {args.model_type}")
     
-    # Create environment for loading (needed by SB3)
-    env = gym.make("highway-ME-basic-v0")
+    # Use the evaluation env for load-time spaces (matches residual training env).
+    env = gym.make(args.env_name)
     
-    # Load model based on specified type or auto-detect
-    if args.model_type == 'residual':
-        model = ResidualSoftDQN.load(str(model_path), env=env)
-        print(f"Model loaded successfully as ResidualSoftDQN!")
-    elif args.model_type == 'dqn_me':
-        model = DQN_ME.load(str(model_path), env=env)
-        print(f"Model loaded successfully as DQN_ME!")
-    else:  # auto-detect
-        # Try to load as ResidualSoftDQN first, then fall back to DQN_ME
-        try:
+    # Load exactly the requested type — never fall back to the base DQN prior.
+    try:
+        if args.model_type == 'residual':
             model = ResidualSoftDQN.load(str(model_path), env=env)
-            print(f"Model loaded successfully as ResidualSoftDQN!")
-        except Exception as e:
-            print(f"Could not load as ResidualSoftDQN, trying DQN_ME...")
-            try:
-                model = DQN_ME.load(str(model_path), env=env)
-                print(f"Model loaded successfully as DQN_ME!")
-            except Exception as e2:
-                raise RuntimeError(f"Failed to load model as either ResidualSoftDQN or DQN_ME. Errors: {e}, {e2}")
+            print("Model loaded successfully as ResidualSoftDQN!")
+        else:
+            model = DQN_ME.load(str(model_path), env=env)
+            print("Model loaded successfully as DQN_ME!")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load model as {args.model_type} from {model_path}. "
+            f"Refusing to fall back to another policy type. Error: {e}"
+        ) from e
     
     # Set default n_steps if neither n_steps nor n_episodes is provided
     n_steps = args.n_steps if args.n_steps is not None else (None if args.n_episodes is not None else 400)
