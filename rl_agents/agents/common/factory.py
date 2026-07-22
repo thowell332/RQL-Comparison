@@ -119,34 +119,96 @@ def preprocess_env(env, preprocessor_configs):
 
 
 def _clone_numpy_rng(rng):
-    """Clone a NumPy Generator without using broken Generator pickle/deepcopy paths."""
+    """Clone a NumPy Generator / RandomState without broken pickle/deepcopy paths."""
     if rng is None:
         return None
-    bit_generator = rng.bit_generator
-    new_bit_generator = bit_generator.__class__()
-    new_bit_generator.state = copy.deepcopy(bit_generator.state)
-    # Preserve gym's RandomNumberGenerator subclass when present.
-    return type(rng)(new_bit_generator)
+    if isinstance(rng, np.random.Generator):
+        bit_generator = rng.bit_generator
+        new_bit_generator = bit_generator.__class__()
+        new_bit_generator.state = copy.deepcopy(bit_generator.state)
+        # Preserve gym's RandomNumberGenerator subclass when present.
+        return type(rng)(new_bit_generator)
+    if isinstance(rng, np.random.RandomState):
+        cloned = np.random.RandomState()
+        cloned.set_state(rng.get_state())
+        return cloned
+    return copy.deepcopy(rng)
 
 
 def _safe_deepcopy(value, memo):
-    """Deep-copy a value, special-casing gym envs and NumPy RNGs."""
+    """Deep-copy a value without calling copy.deepcopy on graphs that embed RNGs.
+
+    A failed ``copy.deepcopy`` can leave incomplete objects in ``memo``. Later
+    vehicles may keep references to an unfinished ``Road`` (no ``network``).
+    We therefore recurse manually for containers and ``__dict__`` objects.
+    """
+    try:
+        value_id = id(value)
+    except Exception:
+        return value
+
+    if value_id in memo:
+        return memo[value_id]
+
     if isinstance(value, gym.Env):
         return safe_deepcopy_env(value, memo=memo)
-    if isinstance(value, np.random.Generator):
-        return _clone_numpy_rng(value)
+
+    if isinstance(value, (np.random.Generator, np.random.RandomState)):
+        cloned = _clone_numpy_rng(value)
+        memo[value_id] = cloned
+        return cloned
+
+    if isinstance(value, (type(None), bool, int, float, complex, str, bytes, type)):
+        return value
+
+    if isinstance(value, np.ndarray):
+        cloned = value.copy()
+        memo[value_id] = cloned
+        return cloned
+
+    if isinstance(value, dict):
+        cloned = {}
+        memo[value_id] = cloned
+        for key, item in value.items():
+            cloned[_safe_deepcopy(key, memo)] = _safe_deepcopy(item, memo)
+        return cloned
+
+    if isinstance(value, list):
+        cloned = []
+        memo[value_id] = cloned
+        cloned.extend(_safe_deepcopy(item, memo) for item in value)
+        return cloned
+
+    if isinstance(value, tuple):
+        # Placeholder keeps recursive references stable for rare self-referential tuples.
+        placeholder = []
+        memo[value_id] = placeholder
+        placeholder.extend(_safe_deepcopy(item, memo) for item in value)
+        cloned = tuple(placeholder)
+        memo[value_id] = cloned
+        return cloned
+
+    if isinstance(value, set):
+        cloned = set()
+        memo[value_id] = cloned
+        for item in value:
+            cloned.add(_safe_deepcopy(item, memo))
+        return cloned
+
+    if hasattr(value, "__dict__"):
+        cloned = value.__class__.__new__(value.__class__)
+        memo[value_id] = cloned
+        for key, item in value.__dict__.items():
+            setattr(cloned, key, _safe_deepcopy(item, memo))
+        return cloned
+
+    # Arrays, numbers, and other deepcopy-safe leaves.
     try:
-        return copy.deepcopy(value, memo=memo)
-    except TypeError:
-        # Nested gym Space / wrapper objects may embed an un-copyable RNG.
-        if hasattr(value, "__dict__"):
-            cls = value.__class__
-            result = cls.__new__(cls)
-            memo[id(value)] = result
-            for key, item in value.__dict__.items():
-                setattr(result, key, _safe_deepcopy(item, memo))
-            return result
-        raise
+        return copy.deepcopy(value, memo)
+    except Exception:
+        # Prefer a shared reference over a hard failure for exotic leaves.
+        memo[value_id] = value
+        return value
 
 
 def safe_deepcopy_env(obj, memo=None):
@@ -154,7 +216,7 @@ def safe_deepcopy_env(obj, memo=None):
         Perform a deep copy of an environment but without copying its viewer.
 
     NumPy>=1.24 changed Generator pickling in a way that breaks copy.deepcopy on
-    gym's RandomNumberGenerator; we clone RNGs explicitly instead.
+    gym's RandomNumberGenerator; we clone object graphs manually instead.
     """
     if memo is None:
         memo = {}
