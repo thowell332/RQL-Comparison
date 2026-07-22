@@ -16,7 +16,8 @@ the same output path resumes unfinished ``episode_id``s, using ``seed + episode_
 so unfinished work continues with the correct RNG stream.
 
 Use ``--n-workers`` to run independent episodes in parallel across CPU cores
-(default: all logical CPUs). ``--n-workers 1`` preserves serial behavior.
+(default: half of logical CPUs, at least 1). ``--n-workers 1`` preserves serial
+behavior. The DQN prior is forced onto CPU (faster for many tiny MCTS queries).
 
 Use ``--start-episode`` with ``--n-episodes`` to shard across machines: episode ids
 are ``[start_episode, n_episodes)`` (e.g. ``--start-episode 50 --n-episodes 100``
@@ -26,6 +27,7 @@ runs 50–99). Each shard should write its own CSV, then concatenate.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import os
 import warnings
@@ -38,7 +40,7 @@ import gym
 import highway_env  # noqa: F401  # registers highway environments
 import numpy as np
 from highway_env.vehicle.controller import ControlledVehicle
-from rl_agents.agents.common.factory import load_agent
+from rl_agents.agents.common.factory import load_agent, load_agent_config
 from supervisor import DiscreteSupervisor
 
 from basic_reward import compute_basic_reward, load_basic_reward_config
@@ -64,6 +66,21 @@ CSV_FIELDS = [
 
 # Per-process state for parallel workers (set by _init_worker).
 _WORKER: dict[str, Any] = {}
+
+
+def default_n_workers() -> int:
+    """Conservative parallel default: half of logical CPUs (min 1)."""
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
+def prepare_agent_config(agent_config: str | dict) -> dict:
+    """Load agent JSON (if needed) and force the DQN prior onto CPU."""
+    if isinstance(agent_config, dict):
+        config = copy.deepcopy(agent_config)
+    else:
+        config = load_agent_config(str(Path(agent_config).expanduser().resolve()))
+    config["device"] = "cpu"
+    return config
 
 
 def episode_seed(base_seed: int, episode: int) -> int:
@@ -239,14 +256,14 @@ def _configure_agent_filter(agent, supervisor: DiscreteSupervisor, safe_decide: 
 
 def _init_worker(
     env_name: str,
-    agent_config: str,
+    agent_config: dict,
     safe_decide: bool,
     seed: int,
 ) -> None:
     """Create env/agent/supervisor once per worker process."""
     warnings.filterwarnings("ignore")
     env = gym.make(env_name)
-    agent = load_agent(agent_config, env)
+    agent = load_agent(copy.deepcopy(agent_config), env)
     supervisor = DiscreteSupervisor(
         env=env.unwrapped,
         profile_name="right_lane",
@@ -391,14 +408,15 @@ def evaluation(
     print(f"Episode id range = [{start_episode}, {n_episodes})")
     print(f"Safe decide (in-tree filter) = {safe_decide}")
     print(f"Workers = {n_workers}")
+    print("DQN prior device = cpu")
     if output_path is not None:
         print(f"Writing episode results to {output_path}")
 
-    agent_config = str(Path(agent_config).expanduser().resolve())
+    agent_config = prepare_agent_config(agent_config)
 
     if n_workers <= 1:
         env = gym.make(env_name)
-        agent = load_agent(agent_config, env)
+        agent = load_agent(copy.deepcopy(agent_config), env)
         supervisor = DiscreteSupervisor(
             env=env.unwrapped,
             profile_name="right_lane",
@@ -507,7 +525,7 @@ def _print_summary(
 
 
 def main():
-    default_workers = os.cpu_count() or 1
+    default_workers = default_n_workers()
     parser = argparse.ArgumentParser(
         description="Run Residual MCTS evaluation (notebook-equivalent)."
     )
@@ -569,7 +587,8 @@ def main():
         default=default_workers,
         help=(
             "Number of parallel worker processes for independent episodes "
-            f"(default: {default_workers} = os.cpu_count()). Use 1 for serial."
+            f"(default: {default_workers} = half of os.cpu_count()). "
+            "Use 1 for serial."
         ),
     )
 
