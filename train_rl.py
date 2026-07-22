@@ -256,6 +256,14 @@ if __name__ == "__main__":
     parser.add_argument('--resume-from-logdir', type=str, default='',
                         help='Resume from the latest checkpoint in the specified log directory. '
                              'Overrides --agent-path if both are provided.')
+    parser.add_argument(
+        '--log-dir',
+        type=str,
+        default='',
+        help='Directory for policies/rollouts/tensorboard for this run. '
+             'Defaults to logs/{algo}/{env-name}_{timestamp}/. '
+             'Pass a Google Drive path on Colab so checkpoints survive disconnects.',
+    )
     args = parser.parse_args()
 
     if args.env_name == '':
@@ -302,9 +310,16 @@ if __name__ == "__main__":
                 f"Please check the path and ensure the checkpoint was saved correctly."
             )
 
-    now = datetime.datetime.now()
-    timestamp = now.isoformat()
-    logdir = os.path.join('logs', args.algo, args.env_name + '_{}/'.format(timestamp))
+    if args.log_dir:
+        logdir = args.log_dir
+        # If resuming into an existing Drive run dir, keep writing there.
+        pathlib.Path(logdir).mkdir(parents=True, exist_ok=True)
+    elif args.resume_from_logdir:
+        logdir = args.resume_from_logdir
+    else:
+        now = datetime.datetime.now()
+        timestamp = now.isoformat()
+        logdir = os.path.join('logs', args.algo, args.env_name + '_{}/'.format(timestamp))
 
     config_updates = {
             'seed': args.seed,
