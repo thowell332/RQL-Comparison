@@ -28,6 +28,34 @@ from imitation.scripts.ingredients import policy_evaluation, rl
 warnings.filterwarnings('ignore')
 
 
+class ResumeBufferRefillCallback(callbacks.BaseCallback):
+    """Hold gradient updates until a freshly reinitialized replay buffer has data.
+
+    Used on resume so ``num_timesteps`` / ε continue while the empty buffer refills.
+    Avoids replacing ``model.train`` (that breaks checkpoint pickling).
+    """
+
+    def __init__(self, min_buffer: int, original_gradient_steps: int):
+        super().__init__()
+        self.min_buffer = min_buffer
+        self.original_gradient_steps = original_gradient_steps
+        self._restored = False
+
+    def _on_step(self) -> bool:
+        if self._restored or self.model is None:
+            return True
+        buf = self.model.replay_buffer
+        if buf is None:
+            return True
+        n_transitions = buf.buffer_size if buf.full else buf.pos
+        if n_transitions >= self.min_buffer:
+            self.model.gradient_steps = self.original_gradient_steps
+            self._restored = True
+        else:
+            self.model.gradient_steps = 0
+        return True
+
+
 def is_valid_checkpoint(checkpoint_path: pathlib.Path) -> bool:
     """Check if a checkpoint file exists and is a valid zip file."""
     if not checkpoint_path.exists():
@@ -207,16 +235,17 @@ def train_rl(
                 if batch_size is None:
                     batch_size = 32
                 min_buffer = max(int(batch_size), 1000)
-                original_train = rl_algo.train
-
-                def train_after_buffer_refill(gradient_steps: int, batch_size: int = 100) -> None:
-                    buf = rl_algo.replay_buffer
-                    n_transitions = buf.buffer_size if buf.full else buf.pos
-                    if n_transitions < min_buffer:
-                        return
-                    return original_train(gradient_steps, batch_size)
-
-                rl_algo.train = train_after_buffer_refill
+                original_gradient_steps = getattr(rl_algo, "gradient_steps", None)
+                if original_gradient_steps is None or original_gradient_steps < 0:
+                    # Match SB3 default when unset / "one update per env step".
+                    original_gradient_steps = 1
+                rl_algo.gradient_steps = 0
+                callback = callbacks.CallbackList(
+                    [
+                        ResumeBufferRefillCallback(min_buffer, original_gradient_steps),
+                        callback,
+                    ]
+                )
                 logging.info(
                     "Replay buffer reinitialized on resume "
                     f"(num_timesteps={rl_algo.num_timesteps} kept; "
