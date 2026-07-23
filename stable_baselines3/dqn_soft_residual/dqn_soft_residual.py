@@ -127,7 +127,7 @@ class ResidualSoftDQN(DQN_ME):
     
     def _setup_model(self) -> None:
         super()._setup_model()
-        self.policy.prior_model = DQN_ME.load(self.prior_model_path)
+        self.policy.prior_model = DQN_ME.load(self.prior_model_path, device=self.device)
         self.policy.prior_model.policy.set_training_mode(False) # freeze prior model parameters
     
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
