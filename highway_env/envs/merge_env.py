@@ -230,6 +230,44 @@ class MergeEnvMEBasic(MergeEnv):
         return 0 if not self.vehicle.on_road else reward
 
 
+class MergeEnvMEAddCourtesyReward(MergeEnvMEBasic):
+    """Residual-train env: courtesy add-on only (``r = -sqrt(x)`` from actual gap).
+
+    Basic collision / speed / right-lane terms are zeroed. Courtesy applies when a
+    ramp merger exists, ego is on the target highway lane, and ego is behind or
+    in line with the merger (see ``merge_courtesy.courtesy_add_on_reward``).
+    """
+
+    @classmethod
+    def default_config(cls) -> dict:
+        cfg = super().default_config()
+        cfg.update({
+            "collision_reward": 0.0,
+            "right_lane_reward": 0.0,
+            "high_speed_reward": 0.0,
+            "merging_speed_reward": 0.0,
+            "lane_change_reward": 0.0,
+            # Envelope length in vehicle lengths (matches MergeCourtesyNormProfile).
+            "courtesy_distance_lengths": 10.0,
+            "courtesy_target_lane_id": 1,
+        })
+        return cfg
+
+    def _reward(self, action: Action) -> float:
+        del action  # state-based add-on (actual gap), like highway AddRight
+        from highway_env.envs.merge_courtesy import courtesy_add_on_reward
+        from highway_env.vehicle.controller import MDPVehicle
+
+        courtesy_distance = (
+            float(self.config["courtesy_distance_lengths"]) * MDPVehicle.LENGTH
+        )
+        return courtesy_add_on_reward(
+            self.vehicle,
+            courtesy_distance=courtesy_distance,
+            target_lane_id=int(self.config["courtesy_target_lane_id"]),
+        )
+
+
 register(
     id='merge-v0',
     entry_point='highway_env.envs:MergeEnv',
@@ -238,4 +276,9 @@ register(
 register(
     id='merge-ME-basic-v0',
     entry_point='highway_env.envs:MergeEnvMEBasic',
+)
+
+register(
+    id='merge-ME-basic-AddCourtesyReward-v0',
+    entry_point='highway_env.envs:MergeEnvMEAddCourtesyReward',
 )

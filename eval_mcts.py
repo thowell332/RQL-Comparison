@@ -16,7 +16,7 @@ the same output path resumes unfinished ``episode_id``s, using ``seed + episode_
 so unfinished work continues with the correct RNG stream.
 
 Use ``--n-workers`` to run independent episodes in parallel across CPU cores
-(default: half of logical CPUs, at least 1). ``--n-workers 1`` preserves serial
+(default: all physical cores, at least 1). ``--n-workers 1`` preserves serial
 behavior. The DQN prior is forced onto CPU (faster for many tiny MCTS queries).
 
 Use ``--start-episode`` with ``--n-episodes`` to shard across machines: episode ids
@@ -68,9 +68,28 @@ CSV_FIELDS = [
 _WORKER: dict[str, Any] = {}
 
 
+def physical_cpu_count() -> int:
+    """Best-effort physical core count (falls back to logical ``os.cpu_count()``)."""
+    try:
+        cores: set[tuple[str, str]] = set()
+        physical_id: str | None = None
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("physical id"):
+                    physical_id = line.split(":", 1)[1].strip()
+                elif line.startswith("core id") and physical_id is not None:
+                    cores.add((physical_id, line.split(":", 1)[1].strip()))
+                    physical_id = None
+        if cores:
+            return len(cores)
+    except OSError:
+        pass
+    return os.cpu_count() or 1
+
+
 def default_n_workers() -> int:
-    """Conservative parallel default: half of logical CPUs (min 1)."""
-    return max(1, (os.cpu_count() or 1) // 2)
+    """Default parallel workers: one per physical core (min 1)."""
+    return max(1, physical_cpu_count())
 
 
 def prepare_agent_config(agent_config: str | dict) -> dict:
@@ -587,7 +606,7 @@ def main():
         default=default_workers,
         help=(
             "Number of parallel worker processes for independent episodes "
-            f"(default: {default_workers} = half of os.cpu_count()). "
+            f"(default: {default_workers} = physical CPU cores). "
             "Use 1 for serial."
         ),
     )
