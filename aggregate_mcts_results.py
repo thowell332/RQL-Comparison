@@ -29,9 +29,10 @@ CSV_FIELDS = [
     "episode_length",
     "episode_reward",
     "basic_reward",
+    "added_reward",
     "mean_speed",
     "mean_lane",
-    "mean_courtesy_gap",
+    "mean_courtesy_gap_violation",
     "courtesy_active_steps",
     "total_norm_cost",
 ]
@@ -41,9 +42,10 @@ NUMERIC_COMPARE_FIELDS = [
     "episode_length",
     "episode_reward",
     "basic_reward",
+    "added_reward",
     "mean_speed",
     "mean_lane",
-    "mean_courtesy_gap",
+    "mean_courtesy_gap_violation",
     "courtesy_active_steps",
     "total_norm_cost",
 ]
@@ -144,6 +146,16 @@ def load_and_dedupe(
                 file_rows += 1
                 key = _row_key(row)
                 cleaned = {field: row.get(field, "") for field in CSV_FIELDS}
+                if not cleaned["added_reward"] and row.get("episode_reward") not in ("", None):
+                    # Older highway CSVs treated episode_reward as the add-on.
+                    cleaned["added_reward"] = row["episode_reward"]
+                if (
+                    not cleaned["mean_courtesy_gap_violation"]
+                    and row.get("mean_courtesy_gap") not in ("", None)
+                ):
+                    # Older merge CSVs logged raw gap; keep blank rather than
+                    # mislabeling raw gap as a violation.
+                    cleaned["mean_courtesy_gap_violation"] = ""
                 cleaned["_source"] = str(csv_path)
 
                 if key not in by_key:
@@ -219,8 +231,17 @@ def print_aggregate(rows: list[dict], stats: dict) -> None:
         )
 
     successes = np.array([_as_float(r["success"]) for r in rows], dtype=float)
-    added = np.array([_as_float(r["episode_reward"]) for r in rows], dtype=float)
+    env_reward = np.array([_as_float(r["episode_reward"]) for r in rows], dtype=float)
     basic = np.array([_as_float(r["basic_reward"]) for r in rows], dtype=float)
+    added = np.array(
+        [
+            _as_float(r["added_reward"])
+            if r.get("added_reward") not in ("", None)
+            else _as_float(r["episode_reward"])
+            for r in rows
+        ],
+        dtype=float,
+    )
     lengths = np.array([_as_float(r["episode_length"]) for r in rows], dtype=float)
     speeds = np.array([_as_float(r["mean_speed"]) for r in rows], dtype=float)
     lanes = np.array([_as_float(r["mean_lane"]) for r in rows], dtype=float)
@@ -229,27 +250,28 @@ def print_aggregate(rows: list[dict], stats: dict) -> None:
     print("-----------")
     print(f"Success rate: {100.0 * np.mean(successes):.2f}%")
     print(f"{len(rows)} Episodes")
+    print(f"Mean env reward: {np.mean(env_reward):.2f} +/- {np.std(env_reward):.2f}")
     print(f"Mean added reward: {np.mean(added):.2f} +/- {np.std(added):.2f}")
     print(f"Mean basic reward: {np.mean(basic):.2f} +/- {np.std(basic):.2f}")
     print(f"Mean episode length: {np.mean(lengths):.2f} +/- {np.std(lengths):.2f}")
     print(f"Mean lane: {np.mean(lanes):.2f} +/- {np.std(lanes):.2f}")
     print(f"Mean speed: {np.mean(speeds):.2f} +/- {np.std(speeds):.2f}")
     print(f"Mean total norm cost: {np.mean(costs):.2f} +/- {np.std(costs):.2f}")
-    if rows and "mean_courtesy_gap" in rows[0]:
-        gaps = np.array(
+    if rows and "mean_courtesy_gap_violation" in rows[0]:
+        violations = np.array(
             [
-                _as_float(r["mean_courtesy_gap"])
-                if r.get("mean_courtesy_gap") not in ("", None)
+                _as_float(r["mean_courtesy_gap_violation"])
+                if r.get("mean_courtesy_gap_violation") not in ("", None)
                 else float("nan")
                 for r in rows
             ],
             dtype=float,
         )
-        if np.any(np.isfinite(gaps)):
-            finite = gaps[np.isfinite(gaps)]
+        if np.any(np.isfinite(violations)):
+            finite = violations[np.isfinite(violations)]
             print(
-                f"Mean courtesy gap: {np.mean(finite):.2f} +/- {np.std(finite):.2f} "
-                f"({len(finite)}/{len(gaps)} episodes with active gate)"
+                f"Mean courtesy gap violation: {np.mean(finite):.2f} +/- {np.std(finite):.2f} "
+                f"({len(finite)}/{len(violations)} episodes with active gate)"
             )
     print("________________________________________________")
 

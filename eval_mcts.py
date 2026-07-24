@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Run Residual MCTS on the highway environment, mirroring the notebook logic.
+"""Run Residual MCTS evaluation with resume-safe CSV logging.
 
-This script is a direct stand-alone version of the Residual MCTS section in
-`Training_demo_Highway.ipynb`:
-    - Same environment (`highway-ME-basic-AddRightReward-v0` by default)
-    - Same evaluation loop and reward shaping
-    - Same use of `agent.plan(obs)` from a config-loaded MCTS agent
+Supports highway and merge environments:
+    - Highway default: ``highway-ME-basic-AddRightReward-v0`` + right-lane profile
+    - Merge: ``merge-ME-basic-AddCourtesyReward-v0`` + ``merge_courtesy`` profile
+
+Merge metrics match SCPS ``test_merge.py`` / ``eval_merge.py``:
+    - ``basic_reward`` from ``configs/MergeEnv/basic_reward.json``
+    - ``added_reward`` from ``courtesy_add_on_reward`` (``-sqrt`` envelope penetration)
+    - ``mean_courtesy_gap_violation`` = mean ``max(0, D - gap)`` while the gate is active
 
 With ``--safe-decide``, impermissible actions (supervisor min-violation mask) are
 filtered out inside Residual MCTS prior/rollout so the returned plan already
@@ -44,7 +47,11 @@ from rl_agents.agents.common.factory import load_agent, load_agent_config
 from supervisor import DiscreteSupervisor
 
 from basic_reward import compute_basic_reward, load_basic_reward_config
-from highway_env.envs.merge_courtesy import courtesy_gate_gap
+from highway_env.envs.merge_courtesy import (
+    DEFAULT_COURTESY_DISTANCE,
+    courtesy_add_on_reward,
+    courtesy_gate_gap,
+)
 
 
 # Suppress noisy warnings, as in the notebook
@@ -60,9 +67,10 @@ CSV_FIELDS = [
     "episode_length",
     "episode_reward",
     "basic_reward",
+    "added_reward",
     "mean_speed",
     "mean_lane",
-    "mean_courtesy_gap",
+    "mean_courtesy_gap_violation",
     "courtesy_active_steps",
     "total_norm_cost",
 ]
@@ -149,24 +157,29 @@ def make_permissibility_action_filter(supervisor: DiscreteSupervisor):
     return action_filter
 
 
+def _empty_metrics() -> dict[str, list]:
+    return {
+        "successes": [],
+        "episode_rewards": [],
+        "episode_basic_rewards": [],
+        "episode_added_rewards": [],
+        "episode_lengths": [],
+        "episode_speeds": [],
+        "episode_lanes": [],
+        "episode_total_norm_costs": [],
+        "episode_ids": [],
+        "episode_courtesy_gap_violations": [],
+        "episode_courtesy_active_steps": [],
+    }
+
+
 def load_completed_episodes(output_path: Path) -> tuple[set[int], dict[str, list]]:
     """Load prior CSV rows for resume.
 
     Returns (completed_episode_ids, metric lists). Metric lists follow CSV row
     order; callers may sort by episode_id when summarizing.
     """
-    metrics = {
-        "successes": [],
-        "episode_rewards": [],
-        "episode_total_rewards": [],
-        "episode_lengths": [],
-        "episode_speeds": [],
-        "episode_lanes": [],
-        "episode_total_norm_costs": [],
-        "episode_ids": [],
-        "episode_courtesy_gaps": [],
-        "episode_courtesy_active_steps": [],
-    }
+    metrics = _empty_metrics()
     completed: set[int] = set()
     if not output_path.is_file() or output_path.stat().st_size == 0:
         return completed, metrics
@@ -189,16 +202,21 @@ def load_completed_episodes(output_path: Path) -> tuple[set[int], dict[str, list
             metrics["episode_ids"].append(episode_id)
             metrics["successes"].append(int(float(row["success"])))
             metrics["episode_rewards"].append(float(row["episode_reward"]))
-            metrics["episode_total_rewards"].append(float(row["basic_reward"]))
+            metrics["episode_basic_rewards"].append(float(row["basic_reward"]))
+            if "added_reward" in row and row["added_reward"] not in ("", None):
+                metrics["episode_added_rewards"].append(float(row["added_reward"]))
+            else:
+                # Older highway CSVs treated episode_reward as the add-on.
+                metrics["episode_added_rewards"].append(float(row["episode_reward"]))
             metrics["episode_lengths"].append(int(float(row["episode_length"])))
             metrics["episode_speeds"].append(float(row["mean_speed"]))
-            metrics["episode_lanes"].append(float(row["mean_lane"]))
+            metrics["episode_lanes"].append(float(row.get("mean_lane", 0.0) or 0.0))
             metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
-            gap_raw = row.get("mean_courtesy_gap", "")
-            if gap_raw in ("", None):
-                metrics["episode_courtesy_gaps"].append(float("nan"))
+            viol_raw = row.get("mean_courtesy_gap_violation", "")
+            if viol_raw in ("", None):
+                metrics["episode_courtesy_gap_violations"].append(float("nan"))
             else:
-                metrics["episode_courtesy_gaps"].append(float(gap_raw))
+                metrics["episode_courtesy_gap_violations"].append(float(viol_raw))
             metrics["episode_courtesy_active_steps"].append(
                 int(float(row.get("courtesy_active_steps", 0) or 0))
             )
@@ -237,6 +255,7 @@ def run_single_episode(
     basic_reward_config: dict,
     env_name: str = "",
     courtesy_target_lane: int = 1,
+    courtesy_threshold: float = DEFAULT_COURTESY_DISTANCE,
 ) -> dict:
     """Run one MCTS episode and return a CSV-ready metrics row."""
     obs, ep_seed = _seed_episode(env, agent, seed, episode_idx)
@@ -245,20 +264,28 @@ def run_single_episode(
     episode_lane = 0.0
     episode_speed = 0.0
     episode_reward = 0.0
-    total_reward = 0.0
+    basic_reward = 0.0
+    added_reward = 0.0
     episode_norm_cost = 0.0
-    courtesy_gaps: list[float] = []
+    courtesy_gap_violations: list[float] = []
     ep_len = 0
     done = False
+    merge = is_merge_env(env_name)
+
+    def ego_vehicle():
+        return env.unwrapped.vehicle if hasattr(env, "unwrapped") else env.vehicle
 
     while not done:
         # Courtesy gap on the pre-step state (matches SCPS test_merge timing).
-        gap = courtesy_gate_gap(
-            env.unwrapped.vehicle if hasattr(env, "unwrapped") else env.vehicle,
-            target_lane_id=courtesy_target_lane,
-        )
-        if gap is not None:
-            courtesy_gaps.append(gap)
+        if merge:
+            gap = courtesy_gate_gap(
+                ego_vehicle(),
+                target_lane_id=courtesy_target_lane,
+            )
+            if gap is not None:
+                courtesy_gap_violations.append(
+                    max(0.0, float(courtesy_threshold) - float(gap))
+                )
 
         actions = agent.plan(obs)
         base_action = int(actions[0])
@@ -282,18 +309,37 @@ def run_single_episode(
         episode_reward += reward
         ep_len += 1
 
-        total_reward += compute_basic_reward(
+        basic_reward += compute_basic_reward(
             forward_speed=forward_speed,
             crashed=bool(env.vehicle.crashed),
             on_road=bool(env.vehicle.on_road),
             config=basic_reward_config,
             lane_fraction=lane_fraction,
         )
+        if merge:
+            # Dual of MergeCourtesyNorm / residual AddCourtesy add-on.
+            added_reward += courtesy_add_on_reward(
+                ego_vehicle(),
+                courtesy_distance=float(courtesy_threshold),
+                target_lane_id=courtesy_target_lane,
+            )
+        else:
+            try:
+                added_reward += float(env.added_reward)
+            except AttributeError:
+                # AddRight residual env returns add-on as the step reward.
+                added_reward += float(reward)
 
-    if is_merge_env(env_name):
+    if merge:
         success = 0 if env.vehicle.crashed else 1
     else:
         success = 1 if ep_len == 40 else 0
+
+    mean_violation = (
+        float(np.mean(courtesy_gap_violations))
+        if courtesy_gap_violations
+        else float("nan")
+    )
 
     return {
         "episode_id": episode_idx,
@@ -301,13 +347,12 @@ def run_single_episode(
         "success": success,
         "episode_length": ep_len,
         "episode_reward": episode_reward,
-        "basic_reward": total_reward,
+        "basic_reward": basic_reward,
+        "added_reward": added_reward,
         "mean_speed": episode_speed / ep_len,
         "mean_lane": episode_lane / ep_len,
-        "mean_courtesy_gap": (
-            float(np.mean(courtesy_gaps)) if courtesy_gaps else float("nan")
-        ),
-        "courtesy_active_steps": len(courtesy_gaps),
+        "mean_courtesy_gap_violation": mean_violation,
+        "courtesy_active_steps": len(courtesy_gap_violations),
         "total_norm_cost": episode_norm_cost,
     }
 
@@ -356,9 +401,12 @@ def _init_worker(
     _WORKER["basic_reward_config"] = load_basic_reward_config(
         basic_reward_config_path_for_env(env_name)
     )
-    _WORKER["courtesy_target_lane"] = (
-        int(courtesy_norm.target_lane_id) if courtesy_norm is not None else 1
-    )
+    if courtesy_norm is not None:
+        _WORKER["courtesy_target_lane"] = int(courtesy_norm.target_lane_id)
+        _WORKER["courtesy_threshold"] = float(courtesy_norm.courtesy_distance)
+    else:
+        _WORKER["courtesy_target_lane"] = 1
+        _WORKER["courtesy_threshold"] = float(DEFAULT_COURTESY_DISTANCE)
     _WORKER["safe_decide"] = safe_decide
 
 
@@ -373,6 +421,7 @@ def _worker_run_episode(episode_idx: int) -> dict:
         basic_reward_config=_WORKER["basic_reward_config"],
         env_name=_WORKER["env_name"],
         courtesy_target_lane=_WORKER["courtesy_target_lane"],
+        courtesy_threshold=_WORKER["courtesy_threshold"],
     )
 
 
@@ -380,14 +429,15 @@ def _record_row(metrics: dict[str, list], row: dict) -> None:
     metrics["episode_ids"].append(int(row["episode_id"]))
     metrics["successes"].append(int(row["success"]))
     metrics["episode_rewards"].append(float(row["episode_reward"]))
-    metrics["episode_total_rewards"].append(float(row["basic_reward"]))
+    metrics["episode_basic_rewards"].append(float(row["basic_reward"]))
+    metrics["episode_added_rewards"].append(float(row["added_reward"]))
     metrics["episode_lengths"].append(int(row["episode_length"]))
     metrics["episode_speeds"].append(float(row["mean_speed"]))
     metrics["episode_lanes"].append(float(row["mean_lane"]))
     metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
-    gap = row.get("mean_courtesy_gap", float("nan"))
-    metrics["episode_courtesy_gaps"].append(
-        float(gap) if gap not in ("", None) else float("nan")
+    viol = row.get("mean_courtesy_gap_violation", float("nan"))
+    metrics["episode_courtesy_gap_violations"].append(
+        float(viol) if viol not in ("", None) else float("nan")
     )
     metrics["episode_courtesy_active_steps"].append(
         int(float(row.get("courtesy_active_steps", 0) or 0))
@@ -397,23 +447,28 @@ def _record_row(metrics: dict[str, list], row: dict) -> None:
 def _print_progress(metrics: dict[str, list]) -> None:
     successes = metrics["successes"]
     episode_rewards = metrics["episode_rewards"]
-    episode_total_rewards = metrics["episode_total_rewards"]
+    episode_basic_rewards = metrics["episode_basic_rewards"]
+    episode_added_rewards = metrics["episode_added_rewards"]
     episode_lengths = metrics["episode_lengths"]
     episode_lanes = metrics["episode_lanes"]
     episode_speeds = metrics["episode_speeds"]
     episode_total_norm_costs = metrics["episode_total_norm_costs"]
-    courtesy_gaps = np.asarray(metrics["episode_courtesy_gaps"], dtype=float)
+    violations = np.asarray(metrics["episode_courtesy_gap_violations"], dtype=float)
 
     print(f"Success rate: {100 * np.mean(successes):.2f}%")
     print(f"{len(successes)} Episodes")
     print(f"Last episode total norm cost: {episode_total_norm_costs[-1]:.2f}")
     print(
-        f"Mean added reward: {np.mean(episode_rewards):.2f} "
+        f"Mean env reward: {np.mean(episode_rewards):.2f} "
         f"+/- {np.std(episode_rewards):.2f}"
     )
     print(
-        f"Mean basic reward: {np.mean(episode_total_rewards):.2f} "
-        f"+/- {np.std(episode_total_rewards):.2f}"
+        f"Mean added reward: {np.mean(episode_added_rewards):.2f} "
+        f"+/- {np.std(episode_added_rewards):.2f}"
+    )
+    print(
+        f"Mean basic reward: {np.mean(episode_basic_rewards):.2f} "
+        f"+/- {np.std(episode_basic_rewards):.2f}"
     )
     print(
         f"Mean episode length: {np.mean(episode_lengths):.2f} "
@@ -423,12 +478,12 @@ def _print_progress(metrics: dict[str, list]) -> None:
         f"Mean lane: {np.mean(episode_lanes):.2f} "
         f"+/- {np.std(episode_lanes):.2f}"
     )
-    if np.any(np.isfinite(courtesy_gaps)):
-        finite = courtesy_gaps[np.isfinite(courtesy_gaps)]
+    if np.any(np.isfinite(violations)):
+        finite = violations[np.isfinite(violations)]
         print(
-            f"Mean courtesy gap: {np.mean(finite):.2f} "
+            f"Mean courtesy gap violation: {np.mean(finite):.2f} "
             f"+/- {np.std(finite):.2f} "
-            f"({len(finite)}/{len(courtesy_gaps)} episodes with active gate)"
+            f"({len(finite)}/{len(violations)} episodes with active gate)"
         )
     print(
         f"Mean speed: {np.mean(episode_speeds):.2f} "
@@ -468,18 +523,7 @@ def evaluation(
     if output_path is not None and resume:
         completed, metrics = load_completed_episodes(output_path)
     else:
-        metrics = {
-            "successes": [],
-            "episode_rewards": [],
-            "episode_total_rewards": [],
-            "episode_lengths": [],
-            "episode_speeds": [],
-            "episode_lanes": [],
-            "episode_total_norm_costs": [],
-            "episode_ids": [],
-            "episode_courtesy_gaps": [],
-            "episode_courtesy_active_steps": [],
-        }
+        metrics = _empty_metrics()
 
     remaining = [i for i in range(start_episode, n_episodes) if i not in completed]
     if not remaining:
@@ -533,9 +577,14 @@ def evaluation(
             (n for n in supervisor.norms if str(n) == "MergeCourtesyNorm"),
             None,
         )
-        courtesy_target_lane = (
-            int(courtesy_norm.target_lane_id) if courtesy_norm is not None else 1
-        )
+        if courtesy_norm is not None:
+            courtesy_target_lane = int(courtesy_norm.target_lane_id)
+            courtesy_threshold = float(courtesy_norm.courtesy_distance)
+        else:
+            courtesy_target_lane = 1
+            courtesy_threshold = float(DEFAULT_COURTESY_DISTANCE)
+        if is_merge_env(env_name):
+            print(f"Courtesy distance threshold = {courtesy_threshold} m")
 
         for episode_idx in remaining:
             print(f"Episode {episode_idx} seed = {episode_seed(seed, episode_idx)}")
@@ -548,6 +597,7 @@ def evaluation(
                 basic_reward_config=basic_reward_config,
                 env_name=env_name,
                 courtesy_target_lane=courtesy_target_lane,
+                courtesy_threshold=courtesy_threshold,
             )
             _record_row(metrics, row)
             if output_path is not None:
@@ -559,6 +609,12 @@ def evaluation(
             print(
                 "Safe decide: filtering MCTS prior/rollout with supervisor "
                 "permissibility mask (per worker)"
+            )
+        if is_merge_env(env_name):
+            # Threshold comes from the supervisor profile inside each worker.
+            print(
+                f"Courtesy distance threshold = {DEFAULT_COURTESY_DISTANCE} m "
+                "(worker uses MergeCourtesyNorm when available)"
             )
         ctx = get_context("spawn")
         with ProcessPoolExecutor(
@@ -590,20 +646,30 @@ def _print_summary(metrics: dict[str, list]) -> None:
         return
 
     episode_rewards = metrics["episode_rewards"]
+    episode_basic_rewards = metrics["episode_basic_rewards"]
+    episode_added_rewards = metrics["episode_added_rewards"]
     episode_lengths = metrics["episode_lengths"]
     episode_lanes = metrics["episode_lanes"]
     episode_speeds = metrics["episode_speeds"]
     episode_total_norm_costs = metrics["episode_total_norm_costs"]
-    courtesy_gaps = np.asarray(
-        metrics.get("episode_courtesy_gaps") or [], dtype=float
+    violations = np.asarray(
+        metrics.get("episode_courtesy_gap_violations") or [], dtype=float
     )
 
     print("________________________________________________")
     print(f"Success rate: {100 * np.mean(successes):.2f}%")
     print(f"{len(successes)} Episodes")
     print(
-        f"Mean reward: {np.mean(episode_rewards):.2f} "
+        f"Mean env reward: {np.mean(episode_rewards):.2f} "
         f"+/- {np.std(episode_rewards):.2f}"
+    )
+    print(
+        f"Mean basic reward: {np.mean(episode_basic_rewards):.2f} "
+        f"+/- {np.std(episode_basic_rewards):.2f}"
+    )
+    print(
+        f"Mean added reward: {np.mean(episode_added_rewards):.2f} "
+        f"+/- {np.std(episode_added_rewards):.2f}"
     )
     print(
         f"Mean episode length: {np.mean(episode_lengths):.2f} "
@@ -622,12 +688,12 @@ def _print_summary(metrics: dict[str, list]) -> None:
             f"Mean total norm cost: {np.mean(episode_total_norm_costs):.2f} "
             f"+/- {np.std(episode_total_norm_costs):.2f}"
         )
-    if np.any(np.isfinite(courtesy_gaps)):
-        finite = courtesy_gaps[np.isfinite(courtesy_gaps)]
+    if np.any(np.isfinite(violations)):
+        finite = violations[np.isfinite(violations)]
         print(
-            f"Mean courtesy gap: {np.mean(finite):.2f} "
+            f"Mean courtesy gap violation: {np.mean(finite):.2f} "
             f"+/- {np.std(finite):.2f} "
-            f"({len(finite)}/{len(courtesy_gaps)} episodes with active gate)"
+            f"({len(finite)}/{len(violations)} episodes with active gate)"
         )
     print("________________________________________________")
 
