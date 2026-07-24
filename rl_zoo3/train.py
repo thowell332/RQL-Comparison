@@ -208,6 +208,16 @@ def train() -> None:
     print("=" * 10, env_id, "=" * 10)
     print(f"Seed: {args.seed}")
 
+    if args.algo in ("dqn_soft_residual", "sac_residual") and "AddCourtesy" in env_id:
+        env_kwargs = args.env_kwargs or {}
+        if "courtesy_distance" in env_kwargs:
+            courtesy_distance = env_kwargs["courtesy_distance"]
+        else:
+            from highway_env.envs.merge_env import MergeEnvMEAddCourtesyReward
+
+            courtesy_distance = MergeEnvMEAddCourtesyReward.default_config()["courtesy_distance"]
+        print(f"Courtesy distance threshold: {courtesy_distance} m")
+
     if args.track:
         try:
             import wandb
