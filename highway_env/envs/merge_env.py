@@ -247,8 +247,8 @@ class MergeEnvMEAddCourtesyReward(MergeEnvMEBasic):
             "high_speed_reward": 0.0,
             "merging_speed_reward": 0.0,
             "lane_change_reward": 0.0,
-            # Envelope length in vehicle lengths (matches MergeCourtesyNormProfile).
-            "courtesy_distance_lengths": 10.0,
+            # Envelope length [m] (matches MergeCourtesyNormProfile.COURTESY_DISTANCE).
+            "courtesy_distance": 90.0,
             "courtesy_target_lane_id": 1,
         })
         return cfg
@@ -256,14 +256,10 @@ class MergeEnvMEAddCourtesyReward(MergeEnvMEBasic):
     def _reward(self, action: Action) -> float:
         del action  # state-based add-on (actual gap), like highway AddRight
         from highway_env.envs.merge_courtesy import courtesy_add_on_reward
-        from highway_env.vehicle.controller import MDPVehicle
 
-        courtesy_distance = (
-            float(self.config["courtesy_distance_lengths"]) * MDPVehicle.LENGTH
-        )
         return courtesy_add_on_reward(
             self.vehicle,
-            courtesy_distance=courtesy_distance,
+            courtesy_distance=float(self.config["courtesy_distance"]),
             target_lane_id=int(self.config["courtesy_target_lane_id"]),
         )
 

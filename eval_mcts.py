@@ -44,6 +44,7 @@ from rl_agents.agents.common.factory import load_agent, load_agent_config
 from supervisor import DiscreteSupervisor
 
 from basic_reward import compute_basic_reward, load_basic_reward_config
+from highway_env.envs.merge_courtesy import courtesy_gate_gap
 
 
 # Suppress noisy warnings, as in the notebook
@@ -61,6 +62,8 @@ CSV_FIELDS = [
     "basic_reward",
     "mean_speed",
     "mean_lane",
+    "mean_courtesy_gap",
+    "courtesy_active_steps",
     "total_norm_cost",
 ]
 
@@ -90,6 +93,22 @@ def physical_cpu_count() -> int:
 def default_n_workers() -> int:
     """Default parallel workers: one per physical core (min 1)."""
     return max(1, physical_cpu_count())
+
+
+def is_merge_env(env_name: str) -> bool:
+    return "merge" in env_name.lower()
+
+
+def supervisor_profile_for_env(env_name: str) -> str:
+    """Use merge courtesy norms on merge envs; right-lane otherwise."""
+    return "merge_courtesy" if is_merge_env(env_name) else "right_lane"
+
+
+def basic_reward_config_path_for_env(env_name: str) -> Path:
+    root = Path(__file__).parent / "configs"
+    if is_merge_env(env_name):
+        return root / "MergeEnv" / "basic_reward.json"
+    return root / "HighwayEnv" / "basic_reward.json"
 
 
 def prepare_agent_config(agent_config: str | dict) -> dict:
@@ -145,6 +164,8 @@ def load_completed_episodes(output_path: Path) -> tuple[set[int], dict[str, list
         "episode_lanes": [],
         "episode_total_norm_costs": [],
         "episode_ids": [],
+        "episode_courtesy_gaps": [],
+        "episode_courtesy_active_steps": [],
     }
     completed: set[int] = set()
     if not output_path.is_file() or output_path.stat().st_size == 0:
@@ -173,6 +194,14 @@ def load_completed_episodes(output_path: Path) -> tuple[set[int], dict[str, list
             metrics["episode_speeds"].append(float(row["mean_speed"]))
             metrics["episode_lanes"].append(float(row["mean_lane"]))
             metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
+            gap_raw = row.get("mean_courtesy_gap", "")
+            if gap_raw in ("", None):
+                metrics["episode_courtesy_gaps"].append(float("nan"))
+            else:
+                metrics["episode_courtesy_gaps"].append(float(gap_raw))
+            metrics["episode_courtesy_active_steps"].append(
+                int(float(row.get("courtesy_active_steps", 0) or 0))
+            )
 
     return completed, metrics
 
@@ -206,6 +235,8 @@ def run_single_episode(
     episode_idx: int,
     seed: int,
     basic_reward_config: dict,
+    env_name: str = "",
+    courtesy_target_lane: int = 1,
 ) -> dict:
     """Run one MCTS episode and return a CSV-ready metrics row."""
     obs, ep_seed = _seed_episode(env, agent, seed, episode_idx)
@@ -216,10 +247,19 @@ def run_single_episode(
     episode_reward = 0.0
     total_reward = 0.0
     episode_norm_cost = 0.0
+    courtesy_gaps: list[float] = []
     ep_len = 0
     done = False
 
     while not done:
+        # Courtesy gap on the pre-step state (matches SCPS test_merge timing).
+        gap = courtesy_gate_gap(
+            env.unwrapped.vehicle if hasattr(env, "unwrapped") else env.vehicle,
+            target_lane_id=courtesy_target_lane,
+        )
+        if gap is not None:
+            courtesy_gaps.append(gap)
+
         actions = agent.plan(obs)
         base_action = int(actions[0])
 
@@ -234,8 +274,8 @@ def run_single_episode(
             if isinstance(env.vehicle, ControlledVehicle)
             else env.vehicle.lane_index[2]
         )
-        lane = lane / max(len(neighbours) - 1, 1)
-        episode_lane += lane
+        lane_fraction = lane / max(len(neighbours) - 1, 1)
+        episode_lane += lane_fraction
 
         forward_speed = env.vehicle.speed * np.cos(env.vehicle.heading)
         episode_speed += forward_speed
@@ -247,17 +287,27 @@ def run_single_episode(
             crashed=bool(env.vehicle.crashed),
             on_road=bool(env.vehicle.on_road),
             config=basic_reward_config,
+            lane_fraction=lane_fraction,
         )
+
+    if is_merge_env(env_name):
+        success = 0 if env.vehicle.crashed else 1
+    else:
+        success = 1 if ep_len == 40 else 0
 
     return {
         "episode_id": episode_idx,
         "seed": ep_seed,
-        "success": 1 if ep_len == 40 else 0,
+        "success": success,
         "episode_length": ep_len,
         "episode_reward": episode_reward,
         "basic_reward": total_reward,
         "mean_speed": episode_speed / ep_len,
         "mean_lane": episode_lane / ep_len,
+        "mean_courtesy_gap": (
+            float(np.mean(courtesy_gaps)) if courtesy_gaps else float("nan")
+        ),
+        "courtesy_active_steps": len(courtesy_gaps),
         "total_norm_cost": episode_norm_cost,
     }
 
@@ -283,9 +333,10 @@ def _init_worker(
     warnings.filterwarnings("ignore")
     env = gym.make(env_name)
     agent = load_agent(copy.deepcopy(agent_config), env)
+    profile_name = supervisor_profile_for_env(env_name)
     supervisor = DiscreteSupervisor(
         env=env.unwrapped,
-        profile_name="right_lane",
+        profile_name=profile_name,
         method="nop",
         enforce_constraints=safe_decide,
         fixed_beta=None,
@@ -293,11 +344,21 @@ def _init_worker(
         verbose=False,
     )
     _configure_agent_filter(agent, supervisor, safe_decide)
+    courtesy_norm = next(
+        (n for n in supervisor.norms if str(n) == "MergeCourtesyNorm"),
+        None,
+    )
     _WORKER["env"] = env
     _WORKER["agent"] = agent
     _WORKER["supervisor"] = supervisor
     _WORKER["seed"] = seed
-    _WORKER["basic_reward_config"] = load_basic_reward_config()
+    _WORKER["env_name"] = env_name
+    _WORKER["basic_reward_config"] = load_basic_reward_config(
+        basic_reward_config_path_for_env(env_name)
+    )
+    _WORKER["courtesy_target_lane"] = (
+        int(courtesy_norm.target_lane_id) if courtesy_norm is not None else 1
+    )
     _WORKER["safe_decide"] = safe_decide
 
 
@@ -310,6 +371,8 @@ def _worker_run_episode(episode_idx: int) -> dict:
         episode_idx=episode_idx,
         seed=_WORKER["seed"],
         basic_reward_config=_WORKER["basic_reward_config"],
+        env_name=_WORKER["env_name"],
+        courtesy_target_lane=_WORKER["courtesy_target_lane"],
     )
 
 
@@ -322,6 +385,13 @@ def _record_row(metrics: dict[str, list], row: dict) -> None:
     metrics["episode_speeds"].append(float(row["mean_speed"]))
     metrics["episode_lanes"].append(float(row["mean_lane"]))
     metrics["episode_total_norm_costs"].append(float(row["total_norm_cost"]))
+    gap = row.get("mean_courtesy_gap", float("nan"))
+    metrics["episode_courtesy_gaps"].append(
+        float(gap) if gap not in ("", None) else float("nan")
+    )
+    metrics["episode_courtesy_active_steps"].append(
+        int(float(row.get("courtesy_active_steps", 0) or 0))
+    )
 
 
 def _print_progress(metrics: dict[str, list]) -> None:
@@ -332,6 +402,7 @@ def _print_progress(metrics: dict[str, list]) -> None:
     episode_lanes = metrics["episode_lanes"]
     episode_speeds = metrics["episode_speeds"]
     episode_total_norm_costs = metrics["episode_total_norm_costs"]
+    courtesy_gaps = np.asarray(metrics["episode_courtesy_gaps"], dtype=float)
 
     print(f"Success rate: {100 * np.mean(successes):.2f}%")
     print(f"{len(successes)} Episodes")
@@ -352,6 +423,13 @@ def _print_progress(metrics: dict[str, list]) -> None:
         f"Mean lane: {np.mean(episode_lanes):.2f} "
         f"+/- {np.std(episode_lanes):.2f}"
     )
+    if np.any(np.isfinite(courtesy_gaps)):
+        finite = courtesy_gaps[np.isfinite(courtesy_gaps)]
+        print(
+            f"Mean courtesy gap: {np.mean(finite):.2f} "
+            f"+/- {np.std(finite):.2f} "
+            f"({len(finite)}/{len(courtesy_gaps)} episodes with active gate)"
+        )
     print(
         f"Mean speed: {np.mean(episode_speeds):.2f} "
         f"+/- {np.std(episode_speeds):.2f}"
@@ -399,6 +477,8 @@ def evaluation(
             "episode_lanes": [],
             "episode_total_norm_costs": [],
             "episode_ids": [],
+            "episode_courtesy_gaps": [],
+            "episode_courtesy_active_steps": [],
         }
 
     remaining = [i for i in range(start_episode, n_episodes) if i not in completed]
@@ -407,14 +487,7 @@ def evaluation(
             f"Nothing to do: shard [{start_episode}, {n_episodes}) already saved "
             f"({len(completed)} episode(s) in CSV)."
         )
-        _print_summary(
-            metrics["successes"],
-            metrics["episode_rewards"],
-            metrics["episode_lengths"],
-            metrics["episode_lanes"],
-            metrics["episode_speeds"],
-            metrics["episode_total_norm_costs"],
-        )
+        _print_summary(metrics)
         return
 
     if completed:
@@ -423,8 +496,10 @@ def evaluation(
             f"{len(remaining)} remaining -> {output_path}"
         )
 
+    profile_name = supervisor_profile_for_env(env_name)
     print(f"Base seed = {seed}")
     print(f"Episode id range = [{start_episode}, {n_episodes})")
+    print(f"Supervisor profile = {profile_name}")
     print(f"Safe decide (in-tree filter) = {safe_decide}")
     print(f"Workers = {n_workers}")
     print("DQN prior device = cpu")
@@ -438,7 +513,7 @@ def evaluation(
         agent = load_agent(copy.deepcopy(agent_config), env)
         supervisor = DiscreteSupervisor(
             env=env.unwrapped,
-            profile_name="right_lane",
+            profile_name=profile_name,
             method="nop",
             enforce_constraints=safe_decide,
             fixed_beta=None,
@@ -451,7 +526,16 @@ def evaluation(
                 "Safe decide: filtering MCTS prior/rollout with supervisor "
                 "permissibility mask"
             )
-        basic_reward_config = load_basic_reward_config()
+        basic_reward_config = load_basic_reward_config(
+            basic_reward_config_path_for_env(env_name)
+        )
+        courtesy_norm = next(
+            (n for n in supervisor.norms if str(n) == "MergeCourtesyNorm"),
+            None,
+        )
+        courtesy_target_lane = (
+            int(courtesy_norm.target_lane_id) if courtesy_norm is not None else 1
+        )
 
         for episode_idx in remaining:
             print(f"Episode {episode_idx} seed = {episode_seed(seed, episode_idx)}")
@@ -462,6 +546,8 @@ def evaluation(
                 episode_idx=episode_idx,
                 seed=seed,
                 basic_reward_config=basic_reward_config,
+                env_name=env_name,
+                courtesy_target_lane=courtesy_target_lane,
             )
             _record_row(metrics, row)
             if output_path is not None:
@@ -494,27 +580,23 @@ def evaluation(
                 print(f"Completed episode {episode_idx} (seed={row['seed']})")
                 _print_progress(metrics)
 
-    _print_summary(
-        metrics["successes"],
-        metrics["episode_rewards"],
-        metrics["episode_lengths"],
-        metrics["episode_lanes"],
-        metrics["episode_speeds"],
-        metrics["episode_total_norm_costs"],
-    )
+    _print_summary(metrics)
 
 
-def _print_summary(
-    successes,
-    episode_rewards,
-    episode_lengths,
-    episode_lanes,
-    episode_speeds,
-    episode_total_norm_costs,
-):
+def _print_summary(metrics: dict[str, list]) -> None:
+    successes = metrics.get("successes") or []
     if not successes:
         print("No completed episodes to summarize.")
         return
+
+    episode_rewards = metrics["episode_rewards"]
+    episode_lengths = metrics["episode_lengths"]
+    episode_lanes = metrics["episode_lanes"]
+    episode_speeds = metrics["episode_speeds"]
+    episode_total_norm_costs = metrics["episode_total_norm_costs"]
+    courtesy_gaps = np.asarray(
+        metrics.get("episode_courtesy_gaps") or [], dtype=float
+    )
 
     print("________________________________________________")
     print(f"Success rate: {100 * np.mean(successes):.2f}%")
@@ -539,6 +621,13 @@ def _print_summary(
         print(
             f"Mean total norm cost: {np.mean(episode_total_norm_costs):.2f} "
             f"+/- {np.std(episode_total_norm_costs):.2f}"
+        )
+    if np.any(np.isfinite(courtesy_gaps)):
+        finite = courtesy_gaps[np.isfinite(courtesy_gaps)]
+        print(
+            f"Mean courtesy gap: {np.mean(finite):.2f} "
+            f"+/- {np.std(finite):.2f} "
+            f"({len(finite)}/{len(courtesy_gaps)} episodes with active gate)"
         )
     print("________________________________________________")
 
